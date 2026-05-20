@@ -135,7 +135,7 @@ def extract_json_object(output: dict[str, Any] | str) -> dict[str, Any]:
         parsed = json.loads(output)
         if isinstance(parsed, dict):
             return parsed
-    raise ValueError("Expected a JSON object or JSON object string")
+    raise ValueError("GPT output is not a JSON object")
 
 
 def call_openai_normalizer(
@@ -236,13 +236,16 @@ def normalize_one_with_retries(
         except LocalValidationError as exc:
             previous_error = exc.reason
             last_note = str(exc)
+        except ValueError as exc:
+            previous_error = "bad_json"
+            last_note = str(exc)
         except OpenAIError as exc:
             previous_error = "gpt_request_failed"
             last_note = str(exc)
 
     return _review_question(
         raw,
-        previous_error if previous_error == "gpt_request_failed" else "max_retries_exceeded",
+        previous_error if previous_error in {"bad_json", "gpt_request_failed"} else "max_retries_exceeded",
         last_gpt_output,
         attempts_allowed,
         f"Last error: {previous_error}. {last_note}",

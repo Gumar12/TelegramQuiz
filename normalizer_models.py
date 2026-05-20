@@ -116,7 +116,7 @@ def validate_clean_question(item: CleanQuestion) -> None:
         _raise("duplicate_options", "options are not unique after normalization")
 
     correct_option = item.options[item.correct - 1]
-    if normalize_key(item.correct_answer) != normalize_key(correct_option):
+    if item.correct_answer != correct_option:
         _raise("correct_not_in_options", "correct_answer does not match options[correct - 1]")
 
     correct_key = normalize_key(correct_option)

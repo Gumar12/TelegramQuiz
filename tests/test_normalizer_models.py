@@ -70,6 +70,17 @@ def test_rejects_correct_answer_mismatch():
     assert exc.value.reason == "correct_not_in_options"
 
 
+def test_rejects_correct_answer_that_only_matches_after_normalization():
+    payload = valid_clean_payload()
+    payload["correct_answer"] = f" {payload['options'][0].lower()} "
+    item = CleanQuestion(**payload)
+
+    with pytest.raises(LocalValidationError) as exc:
+        validate_clean_question(item)
+
+    assert exc.value.reason == "correct_not_in_options"
+
+
 def test_rejects_weak_distractor_substring():
     payload = valid_clean_payload()
     payload["options"] = ["Эмир Тимур", "Тимур", "Касым хан", "Тауке хан"]
