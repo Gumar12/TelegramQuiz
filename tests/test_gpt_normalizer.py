@@ -1,6 +1,6 @@
 import json
 
-from gpt_normalizer import build_messages, build_response_schema, extract_json_object, normalize_dataset
+from gpt_normalizer import build_messages, build_response_schema, extract_json_object, normalize_dataset, parse_args
 from normalizer_io import load_v2_dataset
 from normalizer_models import RawQuestion
 
@@ -18,6 +18,28 @@ def sample_raw_question() -> RawQuestion:
         type="text_quiz",
         source="fixture",
     )
+
+
+def test_parse_args_defaults():
+    args = parse_args(
+        [
+            "--input",
+            "questions_v2.json",
+            "--output",
+            "clean_questions.json",
+            "--review",
+            "review_questions.json",
+            "--report",
+            "normalizer_report.json",
+            "--model",
+            "gpt-4.1-mini",
+        ]
+    )
+
+    assert args.seed == 42
+    assert args.max_retries == 3
+    assert args.limit is None
+    assert args.start_id is None
 
 
 def test_build_messages_includes_json_instruction_and_raw_content_without_source_item_id():

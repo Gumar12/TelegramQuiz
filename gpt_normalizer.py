@@ -280,6 +280,72 @@ def normalize_dataset(
     return clean, review
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Normalize v2 quiz questions with GPT.")
+    parser.add_argument("--input", required=True, help="Path to source questions_v2 JSON")
+    parser.add_argument("--output", required=True, help="Path to write clean questions JSON")
+    parser.add_argument("--review", required=True, help="Path to write review questions JSON")
+    parser.add_argument("--report", required=True, help="Path to write normalizer report JSON")
+    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", ""), help="OpenAI model name")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of questions to normalize")
+    parser.add_argument("--start-id", type=int, default=None, help="First source item id to include")
+    parser.add_argument("--max-retries", type=int, default=3, help="Maximum GPT attempts per question")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic option shuffle seed")
+    parser.add_argument("--dry-run", action="store_true", help="Print report without writing output files")
+    return parser.parse_args(argv)
+
+
+def run(args: argparse.Namespace) -> int:
+    load_dotenv()
+    args.model = args.model or os.getenv("OPENAI_MODEL", "")
+    if not args.model:
+        print("ERROR: --model is required or OPENAI_MODEL must be set", file=sys.stderr)
+        return 1
+    if not os.getenv("OPENAI_API_KEY"):
+        print("ERROR: OPENAI_API_KEY must be set", file=sys.stderr)
+        return 1
+
+    source_data = load_v2_dataset(args.input)
+    total = len(iter_selected_raw_questions(source_data, args.limit, args.start_id))
+    client = OpenAI()
+
+    def api_normalizer(raw: RawQuestion, previous_error: str | None = None) -> GPTQuestion:
+        return call_openai_normalizer(client, args.model, raw, previous_error)
+
+    clean, review = normalize_dataset(
+        source_data,
+        normalize_one=api_normalizer,
+        limit=args.limit,
+        start_id=args.start_id,
+        max_retries=args.max_retries,
+        seed=args.seed,
+    )
+    report = build_report(
+        input_path=args.input,
+        output_path=args.output,
+        review_path=args.review,
+        model=args.model,
+        max_retries=args.max_retries,
+        total=total,
+        clean=clean,
+        review=review,
+    )
+
+    if args.dry_run:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    write_json_atomic(args.output, clean_payload(source_data, clean))
+    write_json_atomic(args.review, review_payload(source_data, review))
+    write_json_atomic(args.report, report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> None:
+    raise SystemExit(run(parse_args()))
+
+
 __all__ = [
     "NormalizeOne",
     "SYSTEM_PROMPT",
@@ -292,4 +358,11 @@ __all__ = [
     "normalize_one_with_retries",
     "iter_selected_raw_questions",
     "normalize_dataset",
+    "parse_args",
+    "run",
+    "main",
 ]
+
+
+if __name__ == "__main__":
+    main()
