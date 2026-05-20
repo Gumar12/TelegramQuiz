@@ -13,6 +13,8 @@
 """
 import asyncio
 import logging
+import sys
+import traceback
 
 from telethon import TelegramClient, events
 
@@ -26,10 +28,48 @@ logging.basicConfig(
 log = logging.getLogger("probe")
 
 
+def _ask_code() -> str:
+    print("\n>>> Telegram прислал код подтверждения в чат 'Telegram'.", flush=True)
+    print(">>> Введи код (только цифры) и нажми Enter:", flush=True)
+    return input("CODE: ").strip()
+
+
+def _ask_password() -> str:
+    print("\n>>> Аккаунт защищён 2FA. Введи cloud-пароль и нажми Enter:", flush=True)
+    return input("PASSWORD: ").strip()
+
+
 async def main() -> None:
     config.assert_credentials()
+    print(f">>> API_ID={config.API_ID}, PHONE={config.PHONE}", flush=True)
+
     client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
-    await client.start(phone=config.PHONE)
+
+    print(">>> Connecting to Telegram…", flush=True)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        print(">>> Session not authorized — starting login flow.", flush=True)
+        try:
+            await client.send_code_request(config.PHONE)
+            code = _ask_code()
+            try:
+                await client.sign_in(phone=config.PHONE, code=code)
+            except Exception as e:
+                if "password" in str(e).lower() or "two-step" in str(e).lower() or "SESSION_PASSWORD_NEEDED" in str(e):
+                    pwd = _ask_password()
+                    await client.sign_in(password=pwd)
+                else:
+                    raise
+        except Exception:
+            print(">>> LOGIN FAILED:", flush=True)
+            traceback.print_exc()
+            await client.disconnect()
+            return
+        print(">>> Login successful. Session saved.", flush=True)
+    else:
+        print(">>> Session already authorized — skipping login.", flush=True)
+
     bot = await client.get_entity(config.BOT_USERNAME)
     log.info("Connected. Listening for messages from @%s (id=%s)", config.BOT_USERNAME, bot.id)
     log.info("Now go to @QuizBot in your Telegram app and create a test quiz manually.")
@@ -38,15 +78,15 @@ async def main() -> None:
     @client.on(events.NewMessage(from_users=bot.id))
     async def handler(event):
         msg = event.message
-        print("=" * 70)
-        print("TEXT:")
-        print(msg.text or "<no text>")
+        print("=" * 70, flush=True)
+        print("TEXT:", flush=True)
+        print(msg.text or "<no text>", flush=True)
         if msg.buttons:
-            print("\nBUTTONS:")
+            print("\nBUTTONS:", flush=True)
             for row_idx, row in enumerate(msg.buttons):
                 for col_idx, btn in enumerate(row):
-                    print(f"  [{row_idx},{col_idx}]: {btn.text!r}")
-        print()
+                    print(f"  [{row_idx},{col_idx}]: {btn.text!r}", flush=True)
+        print(flush=True)
 
     await client.run_until_disconnected()
 
@@ -56,3 +96,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nProbe stopped.")
+    except Exception:
+        print("\n>>> UNEXPECTED ERROR:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(2)
