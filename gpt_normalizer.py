@@ -9,7 +9,8 @@ import sys
 from typing import Any, Callable
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
+from pydantic import ValidationError
 
 from normalizer_io import (
     build_report,
@@ -221,16 +222,20 @@ def normalize_one_with_retries(
                     attempt,
                     "GPT output requested visual review",
                 )
+            validate_clean_question(clean)
             clean = shuffle_options(clean, seed)
             validate_clean_question(clean)
             return clean
         except json.JSONDecodeError as exc:
             previous_error = "bad_json"
             last_note = str(exc)
+        except ValidationError as exc:
+            previous_error = "missing_required_field"
+            last_note = str(exc)
         except LocalValidationError as exc:
             previous_error = exc.reason
             last_note = str(exc)
-        except Exception as exc:
+        except OpenAIError as exc:
             previous_error = "gpt_request_failed"
             last_note = str(exc)
 

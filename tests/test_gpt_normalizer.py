@@ -119,3 +119,133 @@ def test_normalize_dataset_sends_bad_outputs_to_review():
     assert len(review) == 1
     assert review[0].source_item_id == 1
     assert review[0].error_reason in {"duplicate_options", "max_retries_exceeded"}
+
+
+def test_normalize_dataset_sends_mismatched_correct_answer_to_review():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        payload = valid_gpt_payload(raw)
+        payload["correct_answer"] = "Not in the first option"
+        payload["correct"] = 1
+        return payload
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=1,
+        start_id=None,
+        max_retries=1,
+        seed=42,
+    )
+
+    assert clean == []
+    assert len(review) == 1
+    assert review[0].error_reason == "max_retries_exceeded"
+    assert "correct_not_in_options" in review[0].notes
+
+
+def test_normalize_dataset_sends_invalid_correct_indexes_to_review():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+
+    for correct in (0, -1, 5):
+        def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+            payload = valid_gpt_payload(raw)
+            payload["correct"] = correct
+            return payload
+
+        clean, review = normalize_dataset(
+            data,
+            normalize_one=fake_normalizer,
+            limit=1,
+            start_id=None,
+            max_retries=1,
+            seed=42,
+        )
+
+        assert clean == []
+        assert len(review) == 1
+        assert review[0].error_reason == "max_retries_exceeded"
+        assert "correct_not_in_options" in review[0].notes
+
+
+def test_normalize_dataset_retries_with_previous_validation_error():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+    previous_errors: list[str | None] = []
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        previous_errors.append(previous_error)
+        payload = valid_gpt_payload(raw)
+        if len(previous_errors) == 1:
+            payload["options"] = ["Duplicate", "Duplicate", "Choice B", "Choice C"]
+        return payload
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=1,
+        start_id=None,
+        max_retries=2,
+        seed=42,
+    )
+
+    assert len(clean) == 1
+    assert review == []
+    assert previous_errors == [None, "duplicate_options"]
+
+
+def test_normalize_dataset_permanent_duplicate_options_reports_retry_exhaustion():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        payload = valid_gpt_payload(raw)
+        payload["options"] = ["Duplicate", "Duplicate", "Choice B", "Choice C"]
+        return payload
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=1,
+        start_id=None,
+        max_retries=2,
+        seed=42,
+    )
+
+    assert clean == []
+    assert len(review) == 1
+    assert review[0].error_reason == "max_retries_exceeded"
+    assert review[0].attempts == 2
+    assert "duplicate_options" in review[0].notes
+
+
+def test_normalize_dataset_deterministic_shuffle_preserves_correct_answer_position():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        return valid_gpt_payload(raw)
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=1,
+        start_id=None,
+        max_retries=1,
+        seed=42,
+    )
+
+    assert review == []
+    assert len(clean) == 1
+    assert clean[0].options[clean[0].correct - 1] == clean[0].correct_answer
+
+    clean_again, review_again = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=1,
+        start_id=None,
+        max_retries=1,
+        seed=42,
+    )
+
+    assert review_again == []
+    assert clean_again[0].options == clean[0].options
+    assert clean_again[0].correct == clean[0].correct
