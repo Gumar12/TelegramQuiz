@@ -1,17 +1,17 @@
-# DOCX Pipeline Integration Design
+# Интеграция DOCX-пайплайна
 
-**Date:** 2026-05-20
-**Status:** Approved for planning
-**Scope:** Integrate the useful MVP archive pipeline into the existing Quizbot project without replacing the current Telethon uploader.
+**Дата:** 2026-05-20
+**Статус:** одобрено для планирования
+**Область:** встроить полезную часть MVP-архива в текущий проект Quizbot, не заменяя существующий Telethon-загрузчик.
 
-## Goal
+## Цель
 
-Add a first pipeline stage that converts a DOCX file of Kazakhstan history question-answer rows into the JSON format already consumed by the current uploader:
+Добавить первый этап пайплайна: конвертацию DOCX-файла с вопросами и правильными ответами по истории Казахстана в JSON-формат, который уже понимает текущий загрузчик:
 
 ```json
 [
   {
-    "question": "Question text",
+    "question": "Текст вопроса",
     "options": ["A", "B", "C", "D"],
     "correct": 2,
     "explanation": ""
@@ -19,56 +19,56 @@ Add a first pipeline stage that converts a DOCX file of Kazakhstan history quest
 ]
 ```
 
-The source archive `quizbot_pipeline_mvp.zip` already proves the conversion approach on a 299-row DOCX. This project should reuse that logic, but the canonical runtime format remains the existing top-level JSON array expected by `parser.py`, `models.py`, `validator.py`, and `main.py`.
+Архив `quizbot_pipeline_mvp.zip` уже доказывает, что подход работает на DOCX с 299 строками. Мы переиспользуем эту логику, но основным рабочим форматом остаётся текущий JSON-массив, который ожидают `parser.py`, `models.py`, `validator.py` и `main.py`.
 
-## Non-Goals
+## Что не входит в задачу
 
-- Do not replace the existing Telethon uploader with `upload_to_quizbot_skeleton.py`.
-- Do not add GPT-generated distractors in this phase.
-- Do not automatically upload all 299 questions as one quiz. The current validator caps a single quiz at 100 questions for account-safety reasons.
-- Do not modify Telegram credentials, session handling, or @QuizBot flow behavior.
-- Do not rewrite unrelated README encoding or existing user edits.
+- Не заменяем существующий Telethon-загрузчик на `upload_to_quizbot_skeleton.py`.
+- Не добавляем GPT-генерацию ложных вариантов на этом этапе.
+- Не загружаем автоматически все 299 вопросов в один квиз. Текущий валидатор ограничивает один квиз 100 вопросами ради безопасности аккаунта.
+- Не меняем Telegram-credentials, session handling и сценарий общения с @QuizBot.
+- Не переписываем несвязанную кодировку README и не трогаем существующие пользовательские правки.
 
-## Approach
+## Выбранный подход
 
-Use approach 1: integrate the archive's DOCX-to-JSON stage into the current project.
+Используем подход 1: интегрируем DOCX -> JSON этап из архива в текущий проект.
 
-Add a script named `docx_to_quiz_json.py` at the project root. It should read `.docx` paragraphs formatted as:
+В корень проекта добавляется скрипт `docx_to_quiz_json.py`. Он читает `.docx`, где каждый вопрос находится в отдельном абзаце в формате:
 
 ```text
-1. Question text <em dash> Correct answer
-1. Question text <en dash> Correct answer
-1. Question text - Correct answer
+1. Текст вопроса <длинное тире> Правильный ответ
+1. Текст вопроса <среднее тире> Правильный ответ
+1. Текст вопроса - Правильный ответ
 ```
 
-The actual implementation should support the dash variants already used in the archive script: em dash, en dash, and hyphen surrounded by spaces.
+Реализация должна поддерживать варианты разделителя из архивного скрипта: длинное тире, среднее тире и обычный дефис, окружённый пробелами.
 
-The script will extract `number`, `question`, and `answer`, generate three distractors from other answers in the same rough category, shuffle the four options with a deterministic seed, and write uploader-ready JSON.
+Скрипт извлекает `number`, `question` и `answer`, генерирует три ложных варианта из других ответов похожей категории, перемешивает четыре варианта с детерминированным зерном случайности (`seed`) и записывает JSON, готовый для текущего загрузчика.
 
-## Components
+## Компоненты
 
 `docx_to_quiz_json.py`
 
-- Owns DOCX parsing, question-answer splitting, distractor selection, option shuffling, and JSON writing.
-- Depends on `python-docx` and standard library modules.
-- Does not import Telethon or contact Telegram.
+- Отвечает за чтение DOCX, разбор строк, выбор ложных вариантов, перемешивание вариантов и запись JSON.
+- Зависит от `python-docx` и стандартной библиотеки Python.
+- Не импортирует Telethon и не обращается к Telegram.
 
-`models.py` and `validator.py`
+`models.py` и `validator.py`
 
-- Remain the source of truth for uploader input validation.
-- The generated compact JSON must pass these validators.
+- Остаются источником истины для валидации входа загрузчика.
+- Сгенерированный компактный JSON должен проходить эти проверки.
 
 `requirements.txt`
 
-- Add `python-docx` because conversion is now part of the project.
+- Добавляем `python-docx`, потому что конвертация DOCX становится частью проекта.
 
 `questions.example.json`
 
-- May remain the small hand-written example. Generated real `questions.json` stays ignored by git.
+- Может остаться маленьким ручным примером. Реальный сгенерированный `questions.json` остаётся в `.gitignore`.
 
-## Output Modes
+## Режимы вывода
 
-The default output mode should be the compact uploader format:
+Основной режим по умолчанию пишет компактный формат для текущего загрузчика:
 
 ```json
 [
@@ -86,7 +86,7 @@ The default output mode should be the compact uploader format:
 ]
 ```
 
-For archive compatibility, an optional `--extended` flag may write the archive-style object:
+Для совместимости с архивом можно добавить опциональный флаг `--extended`, который пишет объект в старом стиле:
 
 ```json
 {
@@ -97,58 +97,58 @@ For archive compatibility, an optional `--extended` flag may write the archive-s
 }
 ```
 
-The compact mode is required. The extended mode is optional and should not block implementation if it adds friction.
+Компактный режим обязателен. Расширенный режим опционален и не должен блокировать реализацию, если начнёт усложнять задачу.
 
 ## CLI
 
-Required command:
+Обязательная команда:
 
 ```bash
 python docx_to_quiz_json.py --input 11111_dedup.docx --output questions.json --seed 42
 ```
 
-Optional metadata flags:
+Опциональная команда с метаданными:
 
 ```bash
 python docx_to_quiz_json.py --input 11111_dedup.docx --output questions.extended.json --title "История Казахстана" --description "Тест по истории Казахстана" --extended
 ```
 
-Recommended upload command after conversion:
+Рекомендуемая команда загрузки после конвертации:
 
 ```bash
 python main.py --file questions.json --name "История Казахстана"
 ```
 
-If the generated file has more than 100 questions, `main.py` should continue to fail through the existing validator. Splitting large generated files is a separate phase.
+Если сгенерированный файл содержит больше 100 вопросов, `main.py` должен по-прежнему падать через существующий валидатор. Разбиение больших файлов на части — отдельная будущая задача.
 
-## Data Flow
+## Поток данных
 
-1. User provides a DOCX file with one question-answer pair per paragraph.
-2. `docx_to_quiz_json.py` normalizes whitespace and parses rows matching `number. question - answer`.
-3. The script classifies each item as date, person, place/state, term, period, or general.
-4. Distractors are selected from answers in the same category, falling back to all answers if a category is too small.
-5. The correct answer plus three distractors are shuffled using the configured seed.
-6. The script writes UTF-8 JSON with `ensure_ascii=False`.
-7. Existing `parser.py`, `models.py`, and `validator.py` validate the result before upload.
+1. Пользователь даёт DOCX-файл с одной парой вопрос-ответ на абзац.
+2. `docx_to_quiz_json.py` нормализует пробелы и парсит строки формата `номер. вопрос - ответ`.
+3. Скрипт классифицирует каждый пункт как дату, человека, место/государство, термин, период или общий вопрос.
+4. Ложные варианты выбираются из ответов той же категории. Если категория слишком маленькая, используется резервный набор из всех ответов.
+5. Правильный ответ и три ложных варианта перемешиваются с заданным зерном случайности (`seed`).
+6. Скрипт пишет UTF-8 JSON с `ensure_ascii=False`.
+7. Существующие `parser.py`, `models.py` и `validator.py` проверяют результат перед загрузкой.
 
-## Error Handling
+## Обработка ошибок
 
-- Missing input file: fail with a clear CLI error.
-- DOCX with no parseable rows: fail and show the expected row format.
-- Fewer than three valid distractors: fill from deterministic generic fallback values, then validate the final options.
-- Duplicate options after normalization: reject the question or replace the duplicate from fallback candidates before writing.
-- Invalid generated question according to `Question`: fail before writing a misleading output file.
+- Нет входного файла: завершиться с понятной CLI-ошибкой.
+- В DOCX нет распознанных строк: завершиться и показать ожидаемый формат строки.
+- Меньше трёх валидных ложных вариантов: добрать из детерминированных резервных значений, затем проверить итоговый список вариантов.
+- Дубли вариантов после нормализации: заменить дубль резервным кандидатом или отклонить вопрос до записи файла.
+- Сгенерированный вопрос не проходит `Question`: завершиться до записи вводящего в заблуждение выходного файла.
 
-## Testing
+## Проверка
 
-Use lightweight local verification:
+Нужны лёгкие локальные проверки:
 
-- Run the converter against `11111_dedup.docx`.
-- Confirm the generated JSON parses with `parser.load_json`.
-- Confirm `validate_all` passes for a small sliced sample of 3-5 questions.
-- Confirm the full 299-question file intentionally trips the existing `>100` validator if loaded for upload as one quiz.
-- Keep Telegram smoke testing manual and separate: upload only 3-5 questions first.
+- Запустить конвертер на `11111_dedup.docx`.
+- Убедиться, что сгенерированный JSON читается через `parser.load_json`.
+- Убедиться, что `validate_all` проходит на маленьком sample-файле из 3-5 вопросов.
+- Убедиться, что полный файл на 299 вопросов ожидаемо падает на текущем ограничении `>100`, если пытаться загрузить его как один квиз.
+- Дымовую проверку в Telegram оставить ручной и отдельной: сначала прогонять только 3-5 вопросов.
 
-## Implementation Boundaries
+## Границы реализации
 
-The implementation should avoid touching the current uploader flow unless a direct compatibility issue appears. The existing uncommitted changes in `main.py` and `quizbot_client.py` are outside this design and should be preserved.
+Реализация не должна трогать текущий сценарий загрузки, если не появится прямая проблема совместимости. Уже существующие незакоммиченные изменения в `main.py` и `quizbot_client.py` находятся вне этой задачи и должны быть сохранены.
