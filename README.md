@@ -128,3 +128,36 @@ python main.py --file questions.json --name "Название квиза"
         ├── specs/2026-05-20-quizbot-uploader-design.md
         └── plans/2026-05-20-quizbot-uploader.md
 ```
+
+## GPT normalizer
+
+`gpt_normalizer.py` takes extended v2 pipeline output and produces QuizBot-ready clean questions plus a manual review file.
+
+Input:
+- `questions_v2.json`
+
+Outputs:
+- `clean_questions.json`
+- `review_questions.json`
+- `normalizer_report.json`
+
+Environment:
+
+```bash
+OPENAI_API_KEY=sk-your_openai_key_here
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+Smoke run:
+
+```bash
+python gpt_normalizer.py --input questions_v2.json --output clean_questions.json --review review_questions.json --report normalizer_report.json --limit 5
+```
+
+Full run:
+
+```bash
+python gpt_normalizer.py --input questions_v2.json --output clean_questions.json --review review_questions.json --report normalizer_report.json
+```
+
+The normalizer does not upload anything to Telegram. Review `review_questions.json` before using clean output for upload.
