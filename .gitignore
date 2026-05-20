@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# Secrets — credentials, не коммитим
+.env
+*.session
+*.session-journal
+
+# Data — реальные вопросы могут быть приватными
+questions.json
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
