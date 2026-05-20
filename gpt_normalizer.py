@@ -151,10 +151,140 @@ def call_openai_normalizer(
     return GPTQuestion(**parsed)
 
 
+NormalizeOne = Callable[[RawQuestion, str | None], GPTQuestion | dict[str, Any]]
+
+
+def shuffle_options(item: CleanQuestion, seed: int) -> CleanQuestion:
+    options = list(item.options)
+    correct_answer = item.options[item.correct - 1]
+    random.Random(f"{seed}:{item.source_item_id}").shuffle(options)
+    correct = options.index(correct_answer) + 1
+    return item.model_copy(
+        update={
+            "options": options,
+            "correct": correct,
+            "correct_answer": options[correct - 1],
+        }
+    )
+
+
+def _as_gpt_question(output: GPTQuestion | dict[str, Any]) -> GPTQuestion:
+    if isinstance(output, GPTQuestion):
+        return output
+    if isinstance(output, dict):
+        return GPTQuestion(**output)
+    raise ValueError("Expected GPTQuestion or dict output")
+
+
+def _review_question(
+    raw: RawQuestion,
+    error_reason: str,
+    last_gpt_output: GPTQuestion | dict[str, Any] | None,
+    attempts: int,
+    notes: str,
+) -> ReviewQuestion:
+    if isinstance(last_gpt_output, GPTQuestion):
+        serialized_output: dict[str, Any] | str | None = last_gpt_output.model_dump()
+    else:
+        serialized_output = last_gpt_output
+    return ReviewQuestion(
+        source_item_id=raw.id,
+        error_reason=error_reason,
+        raw_item=raw.model_dump(),
+        last_gpt_output=serialized_output,
+        attempts=attempts,
+        notes=notes,
+    )
+
+
+def normalize_one_with_retries(
+    raw: RawQuestion,
+    normalize_one: NormalizeOne,
+    max_retries: int,
+    seed: int,
+) -> CleanQuestion | ReviewQuestion:
+    attempts_allowed = max(1, max_retries)
+    previous_error: str | None = None
+    last_gpt_output: GPTQuestion | dict[str, Any] | None = None
+    last_note = ""
+
+    for attempt in range(1, attempts_allowed + 1):
+        try:
+            last_gpt_output = normalize_one(raw, previous_error)
+            gpt = _as_gpt_question(last_gpt_output)
+            clean = build_clean_question(raw, gpt)
+            if "needs_visual_review" in clean.quality_flags:
+                return _review_question(
+                    raw,
+                    "needs_visual_review",
+                    last_gpt_output,
+                    attempt,
+                    "GPT output requested visual review",
+                )
+            clean = shuffle_options(clean, seed)
+            validate_clean_question(clean)
+            return clean
+        except json.JSONDecodeError as exc:
+            previous_error = "bad_json"
+            last_note = str(exc)
+        except LocalValidationError as exc:
+            previous_error = exc.reason
+            last_note = str(exc)
+        except Exception as exc:
+            previous_error = "gpt_request_failed"
+            last_note = str(exc)
+
+    return _review_question(
+        raw,
+        "max_retries_exceeded",
+        last_gpt_output,
+        attempts_allowed,
+        f"Last error: {previous_error}. {last_note}",
+    )
+
+
+def iter_selected_raw_questions(
+    data: dict[str, Any],
+    limit: int | None,
+    start_id: int | None,
+) -> list[RawQuestion]:
+    questions = [item if isinstance(item, RawQuestion) else RawQuestion(**item) for item in data.get("questions", [])]
+    if start_id is not None:
+        questions = [item for item in questions if item.id >= start_id]
+    if limit is not None:
+        questions = questions[:limit]
+    return questions
+
+
+def normalize_dataset(
+    data: dict[str, Any],
+    normalize_one: NormalizeOne,
+    limit: int | None,
+    start_id: int | None,
+    max_retries: int,
+    seed: int,
+) -> tuple[list[CleanQuestion], list[ReviewQuestion]]:
+    clean: list[CleanQuestion] = []
+    review: list[ReviewQuestion] = []
+    for raw in iter_selected_raw_questions(data, limit, start_id):
+        result = normalize_one_with_retries(raw, normalize_one, max_retries, seed)
+        if isinstance(result, ReviewQuestion):
+            review.append(result)
+        else:
+            clean.append(result)
+    return clean, review
+
+
 __all__ = [
+    "NormalizeOne",
     "SYSTEM_PROMPT",
     "build_messages",
     "build_response_schema",
     "extract_json_object",
     "call_openai_normalizer",
+    "shuffle_options",
+    "_as_gpt_question",
+    "normalize_one_with_retries",
+    "iter_selected_raw_questions",
+    "normalize_dataset",
 ]

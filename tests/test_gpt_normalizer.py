@@ -1,6 +1,7 @@
 import json
 
-from gpt_normalizer import build_messages, build_response_schema, extract_json_object
+from gpt_normalizer import build_messages, build_response_schema, extract_json_object, normalize_dataset
+from normalizer_io import load_v2_dataset
 from normalizer_models import RawQuestion
 
 
@@ -63,3 +64,58 @@ def test_extract_json_object_accepts_json_string():
     payload = {"question": "Кто?", "quality_flags": []}
 
     assert extract_json_object(json.dumps(payload, ensure_ascii=False)) == payload
+
+
+def valid_gpt_payload(raw: RawQuestion) -> dict[str, object]:
+    return {
+        "question": f"Question {raw.id}?",
+        "correct_answer": f"Answer {raw.id}",
+        "options": [f"Answer {raw.id}", f"Choice A {raw.id}", f"Choice B {raw.id}", f"Choice C {raw.id}"],
+        "correct": 1,
+        "explanation": f"Explanation {raw.id}.",
+        "explanation_full": f"Full explanation {raw.id}.",
+        "quality_flags": [],
+    }
+
+
+def test_normalize_dataset_accepts_fake_clean_outputs():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        return valid_gpt_payload(raw)
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=2,
+        start_id=None,
+        max_retries=1,
+        seed=42,
+    )
+
+    assert len(clean) == 2
+    assert len(review) == 0
+    assert clean[0].source_item_id == 1
+
+
+def test_normalize_dataset_sends_bad_outputs_to_review():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        payload = valid_gpt_payload(raw)
+        payload["options"] = ["Duplicate", "Duplicate", "Choice B", "Choice C"]
+        return payload
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=1,
+        start_id=None,
+        max_retries=2,
+        seed=42,
+    )
+
+    assert clean == []
+    assert len(review) == 1
+    assert review[0].source_item_id == 1
+    assert review[0].error_reason in {"duplicate_options", "max_retries_exceeded"}
