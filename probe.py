@@ -27,6 +27,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("probe")
 
+PROBE_LOG_PATH = "probe.log"
+_probe_log_file = open(PROBE_LOG_PATH, "a", encoding="utf-8")
+
+
+def tee(line: str = "") -> None:
+    print(line, flush=True)
+    _probe_log_file.write(line + "\n")
+    _probe_log_file.flush()
+
 
 def _ask_code() -> str:
     print("\n>>> Telegram прислал код подтверждения в чат 'Telegram'.", flush=True)
@@ -78,15 +87,16 @@ async def main() -> None:
     @client.on(events.NewMessage(from_users=bot.id))
     async def handler(event):
         msg = event.message
-        print("=" * 70, flush=True)
-        print("TEXT:", flush=True)
-        print(msg.text or "<no text>", flush=True)
+        tee("=" * 70)
+        tee("TEXT:")
+        tee(msg.text or "<no text>")
         if msg.buttons:
-            print("\nBUTTONS:", flush=True)
+            tee("")
+            tee("BUTTONS:")
             for row_idx, row in enumerate(msg.buttons):
                 for col_idx, btn in enumerate(row):
-                    print(f"  [{row_idx},{col_idx}]: {btn.text!r}", flush=True)
-        print(flush=True)
+                    tee(f"  [{row_idx},{col_idx}]: {btn.text!r}")
+        tee("")
 
     await client.run_until_disconnected()
 
