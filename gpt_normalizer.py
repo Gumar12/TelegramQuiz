@@ -282,6 +282,8 @@ def normalize_dataset(
         result = normalize_one_with_retries(raw, normalize_one, max_retries, seed)
         if isinstance(result, ReviewQuestion):
             review.append(result)
+            if result.error_reason == "gpt_request_failed":
+                break
         else:
             clean.append(result)
     return clean, review

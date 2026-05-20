@@ -305,6 +305,31 @@ def test_normalize_dataset_sends_non_object_json_value_errors_to_review():
     assert "GPT output is not a JSON object" in review[0].notes
 
 
+def test_normalize_dataset_stops_after_exhausted_api_error():
+    data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
+    attempts: list[tuple[int, str | None]] = []
+
+    def fake_normalizer(raw: RawQuestion, previous_error: str | None = None) -> dict[str, object]:
+        attempts.append((raw.id, previous_error))
+        raise gpt_normalizer.OpenAIError("request failed")
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=fake_normalizer,
+        limit=2,
+        start_id=None,
+        max_retries=2,
+        seed=42,
+    )
+
+    assert clean == []
+    assert len(review) == 1
+    assert review[0].source_item_id == 1
+    assert review[0].error_reason == "gpt_request_failed"
+    assert review[0].attempts == 2
+    assert attempts == [(1, None), (1, "gpt_request_failed")]
+
+
 def test_normalize_dataset_sends_mismatched_correct_answer_to_review():
     data = load_v2_dataset("tests/fixtures/questions_v2_sample.json")
 
