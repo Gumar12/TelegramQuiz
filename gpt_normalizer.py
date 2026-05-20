@@ -6,6 +6,7 @@ import json
 import os
 import random
 import sys
+from pathlib import Path
 from typing import Any, Callable
 
 from dotenv import load_dotenv
@@ -241,7 +242,7 @@ def normalize_one_with_retries(
 
     return _review_question(
         raw,
-        "max_retries_exceeded",
+        previous_error if previous_error == "gpt_request_failed" else "max_retries_exceeded",
         last_gpt_output,
         attempts_allowed,
         f"Last error: {previous_error}. {last_note}",
@@ -253,12 +254,15 @@ def iter_selected_raw_questions(
     limit: int | None,
     start_id: int | None,
 ) -> list[RawQuestion]:
-    questions = [item if isinstance(item, RawQuestion) else RawQuestion(**item) for item in data.get("questions", [])]
-    if start_id is not None:
-        questions = [item for item in questions if item.id >= start_id]
-    if limit is not None:
-        questions = questions[:limit]
-    return questions
+    selected: list[RawQuestion | dict[str, Any]] = []
+    for item in data.get("questions", []):
+        item_id = item.id if isinstance(item, RawQuestion) else item.get("id")
+        if start_id is not None and (item_id is None or item_id < start_id):
+            continue
+        selected.append(item)
+        if limit is not None and len(selected) >= limit:
+            break
+    return [item if isinstance(item, RawQuestion) else RawQuestion(**item) for item in selected]
 
 
 def normalize_dataset(
@@ -280,6 +284,40 @@ def normalize_dataset(
     return clean, review
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def _normalized_path(path: str) -> str:
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _path_collision_error(args: argparse.Namespace) -> str | None:
+    paths = {
+        "input": args.input,
+        "output": args.output,
+        "review": args.review,
+        "report": args.report,
+    }
+    seen: dict[str, str] = {}
+    for name, path in paths.items():
+        normalized = _normalized_path(path)
+        if normalized in seen:
+            return f"ERROR: --{name} path collides with --{seen[normalized]} path"
+        seen[normalized] = name
+    return None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Normalize v2 quiz questions with GPT.")
     parser.add_argument("--input", required=True, help="Path to source questions_v2 JSON")
@@ -287,9 +325,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--review", required=True, help="Path to write review questions JSON")
     parser.add_argument("--report", required=True, help="Path to write normalizer report JSON")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", ""), help="OpenAI model name")
-    parser.add_argument("--limit", type=int, default=None, help="Maximum number of questions to normalize")
+    parser.add_argument("--limit", type=_non_negative_int, default=None, help="Maximum number of questions to normalize")
     parser.add_argument("--start-id", type=int, default=None, help="First source item id to include")
-    parser.add_argument("--max-retries", type=int, default=3, help="Maximum GPT attempts per question")
+    parser.add_argument("--max-retries", type=_positive_int, default=3, help="Maximum GPT attempts per question")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic option shuffle seed")
     parser.add_argument("--dry-run", action="store_true", help="Print report without writing output files")
     return parser.parse_args(argv)
@@ -300,6 +338,10 @@ def run(args: argparse.Namespace) -> int:
     args.model = args.model or os.getenv("OPENAI_MODEL", "")
     if not args.model:
         print("ERROR: --model is required or OPENAI_MODEL must be set", file=sys.stderr)
+        return 1
+    collision_error = _path_collision_error(args)
+    if collision_error:
+        print(collision_error, file=sys.stderr)
         return 1
     if not os.getenv("OPENAI_API_KEY"):
         print("ERROR: OPENAI_API_KEY must be set", file=sys.stderr)
@@ -333,13 +375,13 @@ def run(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0
+        return 1 if any(item.error_reason == "gpt_request_failed" for item in review) else 0
 
     write_json_atomic(args.output, clean_payload(source_data, clean))
     write_json_atomic(args.review, review_payload(source_data, review))
     write_json_atomic(args.report, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0
+    return 1 if any(item.error_reason == "gpt_request_failed" for item in review) else 0
 
 
 def main() -> None:
@@ -358,6 +400,9 @@ __all__ = [
     "normalize_one_with_retries",
     "iter_selected_raw_questions",
     "normalize_dataset",
+    "_non_negative_int",
+    "_positive_int",
+    "_path_collision_error",
     "parse_args",
     "run",
     "main",

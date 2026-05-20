@@ -1,6 +1,10 @@
 import json
+from pathlib import Path
 
-from gpt_normalizer import build_messages, build_response_schema, extract_json_object, normalize_dataset, parse_args
+import pytest
+
+import gpt_normalizer
+from gpt_normalizer import build_messages, build_response_schema, extract_json_object, normalize_dataset, parse_args, run
 from normalizer_io import load_v2_dataset
 from normalizer_models import RawQuestion
 
@@ -40,6 +44,141 @@ def test_parse_args_defaults():
     assert args.max_retries == 3
     assert args.limit is None
     assert args.start_id is None
+
+
+def test_parse_args_rejects_bad_numeric_args():
+    base_args = [
+        "--input",
+        "questions_v2.json",
+        "--output",
+        "clean_questions.json",
+        "--review",
+        "review_questions.json",
+        "--report",
+        "normalizer_report.json",
+        "--model",
+        "gpt-4.1-mini",
+    ]
+
+    with pytest.raises(SystemExit):
+        parse_args([*base_args, "--limit", "-1"])
+    with pytest.raises(SystemExit):
+        parse_args([*base_args, "--max-retries", "0"])
+
+
+def write_source(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "quiz_title": "Sample",
+                "quiz_description": "Sample quiz",
+                "questions": [sample_raw_question().model_dump()],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def cli_args(tmp_path: Path, *extra: str):
+    input_path = tmp_path / "questions_v2.json"
+    write_source(input_path)
+    return parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output",
+            str(tmp_path / "clean_questions.json"),
+            "--review",
+            str(tmp_path / "review_questions.json"),
+            "--report",
+            str(tmp_path / "normalizer_report.json"),
+            "--model",
+            "gpt-4.1-mini",
+            *extra,
+        ]
+    )
+
+
+def test_run_missing_api_key_returns_1_before_openai_client_creation(tmp_path, monkeypatch):
+    args = cli_args(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(gpt_normalizer, "OpenAI", lambda: pytest.fail("OpenAI client should not be created"))
+
+    assert run(args) == 1
+
+
+def test_run_path_collision_returns_1_before_openai_client_creation(tmp_path, monkeypatch):
+    input_path = tmp_path / "questions_v2.json"
+    write_source(input_path)
+    args = parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output",
+            str(input_path),
+            "--review",
+            str(tmp_path / "review_questions.json"),
+            "--report",
+            str(tmp_path / "normalizer_report.json"),
+            "--model",
+            "gpt-4.1-mini",
+        ]
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(gpt_normalizer, "OpenAI", lambda: pytest.fail("OpenAI client should not be created"))
+
+    assert run(args) == 1
+
+
+def test_run_dry_run_performs_no_writes_and_returns_0(tmp_path, monkeypatch):
+    args = cli_args(tmp_path, "--dry-run")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(gpt_normalizer, "OpenAI", lambda: object())
+    monkeypatch.setattr(gpt_normalizer, "call_openai_normalizer", lambda client, model, raw, previous_error=None: valid_gpt_payload(raw))
+    writes: list[tuple[object, object]] = []
+    monkeypatch.setattr(gpt_normalizer, "write_json_atomic", lambda path, data: writes.append((path, data)))
+
+    assert run(args) == 0
+    assert writes == []
+
+
+def test_run_exhausted_api_error_returns_nonzero_and_writes_progress(tmp_path, monkeypatch):
+    args = cli_args(tmp_path, "--max-retries", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(gpt_normalizer, "OpenAI", lambda: object())
+
+    def fail_api(client, model, raw, previous_error=None):
+        raise gpt_normalizer.OpenAIError("request failed")
+
+    monkeypatch.setattr(gpt_normalizer, "call_openai_normalizer", fail_api)
+
+    assert run(args) == 1
+
+    output = json.loads(Path(args.output).read_text(encoding="utf-8"))
+    review = json.loads(Path(args.review).read_text(encoding="utf-8"))
+    report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    assert output["questions"] == []
+    assert review["questions"][0]["error_reason"] == "gpt_request_failed"
+    assert report["error_reason_counts"] == {"gpt_request_failed": 1}
+
+
+def test_selection_filters_before_raw_question_construction():
+    valid = sample_raw_question().model_dump()
+    malformed = {"id": 43}
+    data = {"questions": [valid, malformed]}
+
+    clean, review = normalize_dataset(
+        data,
+        normalize_one=lambda raw, previous_error=None: valid_gpt_payload(raw),
+        limit=1,
+        start_id=None,
+        max_retries=1,
+        seed=42,
+    )
+
+    assert len(clean) == 1
+    assert review == []
 
 
 def test_build_messages_includes_json_instruction_and_raw_content_without_source_item_id():
