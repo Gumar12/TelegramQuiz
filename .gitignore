@@ -18,3 +18,11 @@ questions.json
 .vscode/
 .idea/
 .DS_Store
+
+# Generated quiz pipeline data
+questions_v2.json
+clean_questions.json
+review_questions.json
+normalizer_report.json
+.normalizer_tmp/
+quizbot_pipeline_v2/
