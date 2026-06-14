@@ -2,27 +2,50 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
 *.log
 
-# Secrets — credentials, не коммитим
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/coverage/
+frontend/src/data/
+.npm-cache/
+
+# Secrets and credentials
 .env
+.env.*
+!.env.example
+!backend/.env.example
+!frontend/.env.example
 *.session
 *.session-journal
 
-# Data — реальные вопросы могут быть приватными
+# Local/private quiz pipeline data
+/data/
+/media/
+/quizzes/
+/.studio_data/
+*.docx
 questions.json
+questions_v2.json
+clean_questions.json
+review_questions.json
+normalizer_report.json
+.normalizer_tmp/
+quizbot_pipeline_v2/
 
-# IDE
+# Build/package artifacts
+/artifacts/
+/package-lock.json
+
+# Local editor and agent tooling
 .vscode/
 .idea/
+.codex/
+.agents/
+.codewhale/
 .DS_Store
-
-# Generated quiz pipeline data
-/questions_v2.json
-/clean_questions.json
-/review_questions.json
-/normalizer_report.json
-/.normalizer_tmp/
-/quizbot_pipeline_v2/

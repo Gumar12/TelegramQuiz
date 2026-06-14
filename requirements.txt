@@ -1,5 +1,0 @@
-telethon>=1.36
-pydantic>=2.0
-python-dotenv>=1.0
-openai>=1.68.0
-pytest>=8.0

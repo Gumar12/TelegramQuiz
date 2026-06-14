@@ -1,0 +1,1 @@
+"""QuizBot backend package."""

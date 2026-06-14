@@ -63,7 +63,7 @@ Append:
 ```env
 
 # OpenAI API for gpt_normalizer.py
-OPENAI_API_KEY=sk-your_openai_key_here
+OPENAI_API_KEY=replace_me
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
@@ -1339,7 +1339,7 @@ normalizer_report.json
 Environment:
 
 ```env
-OPENAI_API_KEY=sk-your_openai_key_here
+OPENAI_API_KEY=replace_me
 OPENAI_MODEL=gpt-4.1-mini
 ```
 

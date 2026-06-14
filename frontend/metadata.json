@@ -1,0 +1,6 @@
+{
+  "name": "QuizBot Studio",
+  "description": "Локальная панель управления пайплайном создания и валидации квизов для Telegram-бота QuizBot",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

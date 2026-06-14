@@ -1,0 +1,15 @@
+{
+  "quiz_title": "Sample",
+  "format_version": "2.1-clean",
+  "questions": [
+    {
+      "question": "Who is shown?",
+      "options": ["A", "B", "C", "D"],
+      "correct": 2,
+      "explanation": "Because B.",
+      "context_title": "Context 1",
+      "context": "Look at the portrait.",
+      "media": ["media/image.jpg"]
+    }
+  ]
+}

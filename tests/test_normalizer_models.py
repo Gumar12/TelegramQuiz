@@ -1,6 +1,6 @@
 import pytest
 
-from normalizer_models import (
+from backend.normalizer_models import (
     ALLOWED_ERROR_REASONS,
     CleanQuestion,
     LocalValidationError,
@@ -35,6 +35,34 @@ def test_clean_question_accepts_valid_payload():
     validate_clean_question(item)
 
     assert item.source_item_id == 17
+
+
+def test_clean_question_accepts_multiple_correct_answers():
+    payload = valid_clean_payload()
+    payload["question"] = "Выберите верные утверждения"
+    payload["options"] = ["Верно A", "Неверно B", "Верно C", "Неверно D"]
+    payload["correct"] = [1, 3]
+    payload["correct_answer"] = "Верно A; Верно C"
+    payload["correct_answers"] = ["Верно A", "Верно C"]
+    item = CleanQuestion(**payload)
+
+    validate_clean_question(item)
+
+    assert item.correct == [1, 3]
+
+
+def test_rejects_multiple_correct_answers_mismatch():
+    payload = valid_clean_payload()
+    payload["options"] = ["Верно A", "Неверно B", "Верно C", "Неверно D"]
+    payload["correct"] = [1, 3]
+    payload["correct_answer"] = "Верно A; Верно C"
+    payload["correct_answers"] = ["Верно A", "Неверно B"]
+    item = CleanQuestion(**payload)
+
+    with pytest.raises(LocalValidationError) as exc:
+        validate_clean_question(item)
+
+    assert exc.value.reason == "correct_not_in_options"
 
 
 def test_rejects_too_long_question():
@@ -84,6 +112,18 @@ def test_rejects_correct_answer_that_only_matches_after_normalization():
 def test_rejects_weak_distractor_substring():
     payload = valid_clean_payload()
     payload["options"] = ["Эмир Тимур", "Тимур", "Касым хан", "Тауке хан"]
+    item = CleanQuestion(**payload)
+
+    with pytest.raises(LocalValidationError) as exc:
+        validate_clean_question(item)
+
+    assert exc.value.reason == "weak_distractors"
+
+
+def test_rejects_ellipsis_in_correct_answer_option():
+    payload = valid_clean_payload()
+    payload["correct_answer"] = f"{payload['options'][0]}…"
+    payload["options"][0] = payload["correct_answer"]
     item = CleanQuestion(**payload)
 
     with pytest.raises(LocalValidationError) as exc:
