@@ -12,7 +12,7 @@ from typing import Callable
 
 from backend import config
 from backend.flow import UnexpectedBotState, create_quiz, finish_quiz, upload_questions
-from backend.parser import load_json
+from backend.parser import load_json, load_json_metadata
 from backend.quizbot_client import QuizBotClient
 from backend.validator import validate_all
 
@@ -79,7 +79,8 @@ async def run(
     log.info("Speed mode: %s", speed)
     log.info("Loading questions from %s", file_path)
     questions = load_json(file_path)
-    validate_all(questions)
+    metadata = load_json_metadata(file_path)
+    validate_all(questions, allow_duplicate_questions=bool(metadata.get("allow_duplicate_questions")))
     log.info("Loaded and validated %d questions", len(questions))
     if progress_callback:
         progress_callback("loaded", 0, len(questions), f"Loaded {len(questions)} questions")

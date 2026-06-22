@@ -2,9 +2,11 @@
 
 Все задержки рандомизированы — Telegram не любит регулярные паттерны.
 """
+import json
 import os
 import random
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -21,6 +23,39 @@ else:
 
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_STUDIO_CORS_ORIGINS = (
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+)
+
+
+def studio_cors_origins(raw: str | None = None) -> list[str]:
+    """Return explicit local origins allowed to call the Studio API from a browser."""
+    value = os.getenv("STUDIO_CORS_ORIGINS", "") if raw is None else raw
+    if not str(value).strip():
+        return list(DEFAULT_STUDIO_CORS_ORIGINS)
+
+    origins: list[str] = []
+    seen: set[str] = set()
+    for item in str(value).split(","):
+        origin = item.strip().rstrip("/")
+        if not origin:
+            continue
+        if "*" in origin:
+            raise ValueError("STUDIO_CORS_ORIGINS must not contain wildcards")
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("STUDIO_CORS_ORIGINS entries must be absolute http(s) origins")
+        if parsed.path or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("STUDIO_CORS_ORIGINS entries must not include path, query or fragment")
+        normalized = f"{parsed.scheme}://{parsed.netloc}"
+        if normalized not in seen:
+            seen.add(normalized)
+            origins.append(normalized)
+    if not origins:
+        raise ValueError("STUDIO_CORS_ORIGINS must include at least one origin")
+    return origins
+
 # --- Credentials ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -28,6 +63,13 @@ PHONE = os.getenv("PHONE", "")
 SESSION_NAME = str(RUNTIME_DIR / "quizbot_session")
 LOG_PATH = RUNTIME_DIR / "quizbot_uploader.log"
 PROBE_LOG_PATH = RUNTIME_DIR / "probe.log"
+
+# --- Optional AI markup for DOCX parsing ---
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+DEEPSEEK_BASE_URL = (os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip() or "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_TIMEOUT_SECONDS = float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "240"))
+DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "80000"))
 
 # --- Target bot ---
 BOT_USERNAME = "QuizBot"
@@ -51,7 +93,25 @@ SPEED_PRESETS = {
         "LONG_PAUSE_EVERY_N_QUESTIONS": 10,
         "LONG_PAUSE_DURATION": (20.0, 35.0),
     },
+    "slow": {
+        "DELAY_BETWEEN_MESSAGES": (6.0, 10.0),
+        "DELAY_BETWEEN_QUESTIONS": (60.0, 90.0),
+        "LONG_PAUSE_EVERY_N_QUESTIONS": 8,
+        "LONG_PAUSE_DURATION": (180.0, 300.0),
+    },
 }
+
+AUTO_SPEED_POLICY = {
+    "preset": "fast",
+    "cooldown_every_uploaded": 40,
+    "cooldown_duration": (300.0, 420.0),
+}
+
+# --- ETA model ---
+ETA_SETTINGS_FILENAME = "eta_settings.json"
+ETA_BOT_RESPONSE_SECONDS = float(os.getenv("ETA_BOT_RESPONSE_SECONDS", "2.0"))
+ETA_MIN_BOT_RESPONSE_SECONDS = 0.0
+ETA_MAX_BOT_RESPONSE_SECONDS = 30.0
 
 # --- Timeouts / retries ---
 WAIT_REPLY_TIMEOUT = 15.0
@@ -77,8 +137,78 @@ def apply_speed_mode(mode: str) -> None:
     globals()["LONG_PAUSE_DURATION"] = preset["LONG_PAUSE_DURATION"]
 
 
+def auto_speed_preset(uploaded_questions: int) -> str:
+    """Return the concrete preset for upload --speed auto."""
+    return str(AUTO_SPEED_POLICY["preset"])
+
+
+def load_eta_settings(runtime_dir: str | Path | None = None) -> dict[str, float]:
+    """Load tunable ETA settings stored next to runtime state."""
+    settings = {"bot_response_seconds": _clamp_eta_seconds(ETA_BOT_RESPONSE_SECONDS)}
+    path = _eta_settings_path(runtime_dir)
+    if not path.exists():
+        return settings
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return settings
+    if isinstance(payload, dict) and "bot_response_seconds" in payload:
+        settings["bot_response_seconds"] = _clamp_eta_seconds(payload["bot_response_seconds"])
+    return settings
+
+
+def save_eta_settings(settings: dict[str, float], runtime_dir: str | Path | None = None) -> dict[str, float]:
+    """Persist tunable ETA settings and return sanitized values."""
+    current = load_eta_settings(runtime_dir)
+    if "bot_response_seconds" in settings:
+        current["bot_response_seconds"] = _clamp_eta_seconds(settings["bot_response_seconds"])
+    path = _eta_settings_path(runtime_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return current
+
+
+def estimate_timing_profile(mode: str, *, runtime_dir: str | Path | None = None) -> dict[str, float | int]:
+    """Build ETA timings from the same speed presets used by uploads."""
+    concrete_mode = auto_speed_preset(0) if mode == "auto" else mode
+    preset = SPEED_PRESETS.get(concrete_mode, SPEED_PRESETS["normal"])
+    eta_settings = load_eta_settings(runtime_dir)
+    return {
+        "seconds_per_question": (
+            _avg_delay(preset["DELAY_BETWEEN_MESSAGES"])
+            + _avg_delay(preset["DELAY_BETWEEN_QUESTIONS"])
+            + eta_settings["bot_response_seconds"]
+        ),
+        "long_pause_every": int(preset.get("LONG_PAUSE_EVERY_N_QUESTIONS") or 0),
+        "long_pause_seconds": _avg_delay(preset["LONG_PAUSE_DURATION"]),
+        "cooldown_every_uploaded": int(AUTO_SPEED_POLICY.get("cooldown_every_uploaded") or 0) if mode == "auto" else 0,
+        "cooldown_seconds": _avg_delay(AUTO_SPEED_POLICY.get("cooldown_duration", (0.0, 0.0))) if mode == "auto" else 0.0,
+        "bot_response_seconds": eta_settings["bot_response_seconds"],
+    }
+
+
+def _eta_settings_path(runtime_dir: str | Path | None = None) -> Path:
+    return Path(runtime_dir) / ETA_SETTINGS_FILENAME if runtime_dir is not None else RUNTIME_DIR / ETA_SETTINGS_FILENAME
+
+
+def _avg_delay(value: object) -> float:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (float(value[0]) + float(value[1])) / 2
+    return float(value or 0)
+
+
+def _clamp_eta_seconds(value: object) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = ETA_BOT_RESPONSE_SECONDS
+    return max(ETA_MIN_BOT_RESPONSE_SECONDS, min(ETA_MAX_BOT_RESPONSE_SECONDS, seconds))
+
+
 def assert_credentials() -> None:
-    """Проверяет, что .env заполнен. Падает с понятной ошибкой, если нет."""
+    """Проверяет legacy env-credentials для старых CLI/probe сценариев."""
     missing = [
         name
         for name, val in [("API_ID", API_ID), ("API_HASH", API_HASH), ("PHONE", PHONE)]
@@ -87,5 +217,7 @@ def assert_credentials() -> None:
     if missing:
         raise RuntimeError(
             f"Missing env vars: {', '.join(missing)}. "
-            f"Copy backend/.env.example to backend/.env and fill in values from https://my.telegram.org"
+            "The web platform does not use these legacy env vars; configure "
+            "Telegram account profiles on the backend side. For legacy CLI/probe usage, "
+            "provide API_ID/API_HASH/PHONE manually."
         )

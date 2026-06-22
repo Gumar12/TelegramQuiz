@@ -29,7 +29,12 @@ def check_question_count(questions: list[Question], max_count: int = MAX_QUESTIO
         )
 
 
-def validate_all(questions: list[Question]) -> None:
+def validate_all(
+    questions: list[Question],
+    *,
+    allow_duplicate_questions: bool = False,
+) -> None:
     """Запускает все list-level проверки."""
-    check_no_duplicate_questions(questions)
+    if not allow_duplicate_questions:
+        check_no_duplicate_questions(questions)
     check_question_count(questions)

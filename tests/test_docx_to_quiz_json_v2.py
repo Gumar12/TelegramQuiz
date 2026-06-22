@@ -192,16 +192,94 @@ def test_attach_distractors_generates_contextual_options_for_timur_block():
         "Могулистана",
         "Золотой Орды",
     ]
-    assert statement["options"] == [
-        "Создал государство в Мавераннахре",
-        "был чингизидом",
-        "принял ханский титул",
-        "происходил из рода Джучи",
-    ]
-    for item in [portrait, century, reason, ulus, statement]:
+    assert statement["type"] == "needs_distractor_review"
+    assert statement["options"] == []
+    assert statement["correct"] is None
+    assert statement["distractors_source"] == "needs_contextual_distractors"
+    for item in [portrait, century, reason, ulus]:
         assert all("…" not in option for option in item["options"])
         assert all(len(option) <= 100 for option in item["options"])
         assert not any("колониальной системы" in option for option in item["options"])
+
+
+def test_statement_selection_without_source_options_does_not_get_chingisid_fallbacks():
+    blocks = [
+        {"type": "text", "text": "Контекст Nº1"},
+        {
+            "type": "text",
+            "text": "Текст об улусе Джучи и владениях Чагатая.",
+        },
+        {"type": "text", "text": "Выберите верные утверждения:"},
+        {"type": "text", "text": "I. В тексте описываются территориальные владения Чагатая;"},
+    ]
+
+    items = parse_blocks_to_items(blocks)
+
+    assert len(items) == 1
+    assert items[0]["question"] == "Выберите верные утверждения"
+    assert items[0]["correct_answer"] == "I. В тексте описываются территориальные владения Чагатая;"
+    assert items[0]["type"] == "needs_distractor_review"
+    assert items[0]["options"] == []
+    assert items[0]["correct"] is None
+
+
+def test_roman_statement_sequence_block_uses_prompt_as_question_and_statements_as_context():
+    blocks = [
+        {"type": "text", "text": "Установите верную хронологическую последовательность событий:"},
+        {"type": "text", "text": "I. Первая Конституция РК;"},
+        {"type": "text", "text": "II. Размежевание границ республик Средней Азии;"},
+        {"type": "text", "text": "III. Возвращение исконного имени «казах» народу;"},
+        {"type": "text", "text": "IV. Декларация прав трудящихся."},
+        {"type": "text", "text": "A) II, I, III, IV"},
+        {"type": "text", "text": "B) I, IV, II, III"},
+        {"type": "text", "text": "C) III, II, I, IV"},
+        {"type": "text", "text": "D) IV, II, III, I", "bold_text": "D) IV, II, III, I"},
+    ]
+
+    items = parse_blocks_to_items(blocks)
+
+    assert len(items) == 1
+    assert items[0]["question"] == "Установите верную хронологическую последовательность событий"
+    assert "I. Первая Конституция РК;" in items[0]["context"]
+    assert "IV. Декларация прав трудящихся." in items[0]["context"]
+    assert items[0]["options"] == [
+        "II, I, III, IV",
+        "I, IV, II, III",
+        "III, II, I, IV",
+        "IV, II, III, I",
+    ]
+    assert items[0]["correct"] == 4
+    assert items[0]["correct_answer"] == "IV, II, III, I"
+
+
+def test_quoted_context_with_colon_is_not_split_into_inline_question():
+    blocks = [
+        {
+            "type": "text",
+            "text": "«Телесцы хотели одного – уничтожить жужаней, и Бумынь это знал.",
+        },
+        {
+            "type": "text",
+            "text": "Разгром жужаней. Разгневанный хан ответил грубо: «Ты мой плавильщик!»",
+        },
+        {
+            "type": "text",
+            "text": "Бумынь принял титул Иль-хан, но в конце 552 г. умер».",
+        },
+        {"type": "text", "text": "Титул правителя тюрков:"},
+        {"type": "text", "text": "A) гурхан"},
+        {"type": "text", "text": "B) каган", "bold_text": "B) каган"},
+        {"type": "text", "text": "C) хунтайджи"},
+        {"type": "text", "text": "D) джабгу"},
+    ]
+
+    items = parse_blocks_to_items(blocks)
+
+    assert len(items) == 1
+    assert items[0]["question"] == "Титул правителя тюрков"
+    assert "Разгром жужаней." in items[0]["context"]
+    assert items[0]["options"] == ["гурхан", "каган", "хунтайджи", "джабгу"]
+    assert items[0]["correct"] == 2
 
 
 def test_unknown_items_are_marked_for_distractor_review_instead_of_getting_global_junk():

@@ -6,6 +6,23 @@ from pydantic import ValidationError
 from backend.models import Question
 
 
+def _load_raw_json(path: str | Path) -> object:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Questions file not found: {p}")
+
+    raw_text = p.read_text(encoding="utf-8")
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {p}: {e}") from e
+
+
+def load_json_metadata(path: str | Path) -> dict:
+    raw = _load_raw_json(path)
+    return raw if isinstance(raw, dict) else {}
+
+
 def load_json(path: str | Path) -> list[Question]:
     """Читает JSON-файл и парсит в список Question.
 
@@ -13,14 +30,7 @@ def load_json(path: str | Path) -> list[Question]:
     pydantic не прошла.
     """
     p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Questions file not found: {p}")
-
-    raw_text = p.read_text(encoding="utf-8")
-    try:
-        raw = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in {p}: {e}") from e
+    raw = _load_raw_json(p)
 
     if isinstance(raw, dict) and "questions" in raw:
         raw = raw["questions"]

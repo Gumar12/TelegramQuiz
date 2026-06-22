@@ -38,10 +38,8 @@ if [ ! -f "backend/.env" ]; then
   echo "backend/.env was not found. Creating it from backend/.env.example..."
   cp backend/.env.example backend/.env
   echo
-  echo "Fill backend/.env with Telegram/OpenAI values, then return to this window."
-  open -e backend/.env
-  echo
-  read -r -p "Press Enter after backend/.env is filled..."
+  echo "Telegram profiles are configured in the web platform: Accounts."
+  echo "backend/.env is only for optional service integrations."
 fi
 
 PIDS="$(lsof -tiTCP:${PORT} -sTCP:LISTEN 2>/dev/null || true)"

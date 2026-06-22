@@ -10,7 +10,7 @@ Telethon-userbot для автоматической заливки вопрос
 
 1. Открыть https://my.telegram.org → войти по номеру → **API development tools**
 2. Создать приложение (любые название/описание)
-3. Скопировать `api_id` и `api_hash`
+3. Скопировать `api_id` и `api_hash` — они вводятся в веб-платформе при создании Telegram-профиля.
 
 ### 2. Установка
 
@@ -30,25 +30,19 @@ copy backend\.env.example backend\.env          # Windows
 # cp backend/.env.example backend/.env          # Linux/Mac
 ```
 
-Открыть `backend/.env` и заполнить:
-- `API_ID` — число из my.telegram.org
-- `API_HASH` — строка оттуда же
-- `PHONE` — твой номер в формате `+77001234567`
+`backend/.env` нужен только для опциональных сервисов вроде DeepSeek/OpenAI.
+Telegram-данные входа (`api_id`, `api_hash`, телефон) вводятся в разделе
+`Аккаунты` веб-платформы и не читаются из `.env`.
 
-### 4. Первый запуск (probe)
+### 4. Первый запуск платформы
 
 ```bash
-python -m backend.probe
+python -m backend.studio_api
 ```
 
-При первом запуске Telegram пришлёт код подтверждения в чат с самим собой. Введи его.
-Если включена 2FA — попросит пароль. После этого создастся `data/runtime/quizbot_session.session`.
-
-С запущенным `python -m backend.probe` открой @QuizBot в любом Telegram-клиенте и создай тестовый квиз
-руками. Все сообщения бота с подписями кнопок будут литься в терминал. Перенеси их в
-`docs/probe-log.md` и обнови `BOT_PROMPTS` в `backend/flow.py`.
-
-После этого — `Ctrl+C` в терминале с probe.
+После запуска backend открой веб-интерфейс, перейди в `Аккаунты`, создай профиль
+и введи код Telegram в форме платформы. Session-файл будет создан внутри
+`data/runtime/accounts/sessions/`.
 
 ## Использование
 
@@ -106,6 +100,7 @@ python -m backend.main --file questions.json --name "Название квиза
 ## Безопасность
 
 - `backend/.env` и `*.session` файлы НЕ коммитить (уже в `.gitignore`)
+- Telegram API ID/API Hash/телефон не хранить в `.env`; добавлять их через платформу.
 - Session-файл = доступ к твоему Telegram-аккаунту, обращаться как с приватным ключом
 - При утечке session — отозвать сессию в Telegram → Settings → Devices
 

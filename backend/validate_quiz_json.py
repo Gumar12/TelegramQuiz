@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.models import Question
-from backend.parser import load_json
+from backend.parser import load_json, load_json_metadata
 from backend.validator import validate_all
 
 
@@ -32,6 +32,10 @@ def load_raw_items(path: str | Path) -> list[dict[str, Any]]:
 
 def load_questions_with_raw(path: str | Path) -> tuple[list[Question], list[dict[str, Any]]]:
     return load_json(path), load_raw_items(path)
+
+
+def allow_duplicate_questions(path: str | Path) -> bool:
+    return bool(load_json_metadata(path).get("allow_duplicate_questions"))
 
 
 def _correct_indexes(question: Question) -> list[int]:
@@ -130,7 +134,7 @@ def validate_file(path: str | Path, *, strict: bool = False) -> int:
     configure_stdout()
     try:
         questions, raw_items = load_questions_with_raw(path)
-        validate_all(questions)
+        validate_all(questions, allow_duplicate_questions=allow_duplicate_questions(path))
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

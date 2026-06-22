@@ -13,7 +13,7 @@ def clean_text_value(value: str) -> str:
 
 
 class Question(BaseModel):
-    question: str = Field(min_length=1, max_length=300)
+    question: str = Field(min_length=1, max_length=255)
     options: list[str] = Field(min_length=2, max_length=10)
     correct: int | list[int]
     explanation: str = Field(default="", max_length=200)

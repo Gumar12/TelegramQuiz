@@ -1,12 +1,40 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Loader2, Lock, Play, ShieldCheck } from 'lucide-react';
-import { api } from './api';
-import { JobEvent, PipelineState, QuizGroup, SourceGroupSummary, TaskStatus, ValidationReport } from './types';
-import Sidebar from './components/Sidebar';
-import ImportScreen from './components/ImportScreen';
-import MonitorScreen from './components/MonitorScreen';
-import EditorScreen from './components/EditorScreen';
-import DeployScreen from './components/DeployScreen';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { api, mediaUrl } from './api';
+import type { AppRouteId } from './app/routes';
+import { AppShell } from './components/layout/AppShell';
+import { ArchiveDeleteQuizModal, StopRunModal, SwitchAccountModal, TelegramErrorModal, UnsavedChangesModal } from './components/modals';
+import type { PublicAccountProfile } from './components/domain/accounts';
+import type { RunSummary } from './components/domain/runs';
+import DashboardScreen, {
+  type DashboardQuizAction,
+  type DashboardQuizRow,
+  type DashboardRunSummary,
+} from './screens/DashboardScreen';
+import CreateQuizScreen from './screens/CreateQuizScreen';
+import QuizEditorScreen, { type QuizEditorExitRequest, type QuizEditorGroup } from './screens/QuizEditorScreen';
+import QuizzesScreen, { type QuizListItem } from './screens/QuizzesScreen';
+import RunsScreen, { type LaunchQuizCandidate } from './screens/RunsScreen';
+import AccountsScreen, { type TelegramLoginPanelState } from './screens/AccountsScreen';
+import SettingsScreen, { type SettingsValues } from './screens/SettingsScreen';
+import {
+  closeModal,
+  openModal,
+  useModalStore,
+  type AccountConnectionStatus,
+  type AccountOption,
+} from './state/modalStore';
+import type {
+  AccountProfilePublic,
+  ActiveRunResponse,
+  JobEvent,
+  JobSnapshot,
+  PipelineState,
+  QuizGroup,
+  RunStatusSnapshot,
+  SettingsResponse,
+  TaskStatus,
+  ValidationReport,
+} from './types';
 
 const idlePipeline: PipelineState = {
   status: 'idle',
@@ -26,7 +54,15 @@ const defaultWorkspaceConfig = {
   mediaRoot: '.',
 };
 
+const SETTINGS_STORAGE_KEY = 'quizbot.platform.settings';
+
+type TelegramLoginUiState = TelegramLoginPanelState & {
+  loginId?: string;
+  profileId: string;
+};
+
 function taskStatusForJob(type: string, fallback: TaskStatus): TaskStatus {
+  if (type.includes('create')) return 'parsing';
   if (type.includes('parse')) return 'parsing';
   if (type.includes('generate')) return 'normalizing';
   if (type.includes('validate')) return 'validating';
@@ -34,36 +70,451 @@ function taskStatusForJob(type: string, fallback: TaskStatus): TaskStatus {
   return fallback;
 }
 
+function countQuizIssues(group: QuizGroup): number {
+  return group.questions.reduce(
+    (total, question) => total + (question.warnings?.length ?? 0) + (question.quality_flags?.length ?? 0),
+    0,
+  );
+}
+
+function rowFromQuizGroup(group: QuizGroup): DashboardQuizRow {
+  const issues = countQuizIssues(group);
+
+  if (group.status === 'ready') {
+    return {
+      action: 'launch',
+      actionLabel: 'Запустить',
+      errors: issues,
+      id: group.id,
+      name: group.name,
+      stage: 'Готов к запуску',
+      status: issues > 0 ? 'Есть предупреждения' : 'Готов',
+      tone: issues > 0 ? 'warning' : 'success',
+    };
+  }
+
+  if (group.status === 'review') {
+    return {
+      action: 'fix',
+      actionLabel: 'Исправить',
+      errors: Math.max(issues, 1),
+      id: group.id,
+      name: group.name,
+      stage: 'Проверка JSON',
+      status: 'Нужно исправить',
+      tone: 'danger',
+    };
+  }
+
+  return {
+    action: 'edit',
+    actionLabel: 'Открыть',
+    errors: issues,
+    id: group.id,
+    name: group.name,
+    stage: 'Черновик',
+    status: 'В работе',
+    tone: 'neutral',
+  };
+}
+
+function mapAccountStatus(status: string): AccountConnectionStatus {
+  const normalized = status.toLowerCase();
+
+  if (['connected', 'authorized', 'active', 'enabled_authorized', 'ready', 'ok'].includes(normalized)) {
+    return 'connected';
+  }
+
+  if (normalized === 'enabled') {
+    return 'disconnected';
+  }
+
+  if (['needs_reconnect', 'needs-auth', 'needs_auth', 'expired', 'missing_session'].includes(normalized)) {
+    return 'needs_reconnect';
+  }
+
+  if (['disabled', 'off'].includes(normalized)) {
+    return 'disabled';
+  }
+
+  return 'disconnected';
+}
+
+function accountName(account: AccountProfilePublic | null | undefined): string {
+  return account?.display_name?.trim() || account?.id || 'Нет аккаунта';
+}
+
+function errorLabel(error: unknown): string {
+  if (!(error instanceof Error)) return 'Не удалось выполнить действие';
+  try {
+    const parsed = JSON.parse(error.message) as { detail?: unknown };
+    if (typeof parsed.detail === 'string') {
+      if (parsed.detail === 'Telegram login code expired') {
+        return 'Код Telegram истёк. Запросите новый код.';
+      }
+      if (parsed.detail === 'Telegram code request expired') {
+        return 'Запрос кода Telegram устарел. Запросите новый код.';
+      }
+      if (parsed.detail === 'Telegram rejected the login code') {
+        return 'Telegram отклонил код. Проверьте код или запросите новый.';
+      }
+      if (parsed.detail === 'Telegram login flow expired') {
+        return 'Вход в Telegram истёк. Запросите новый код.';
+      }
+      return parsed.detail;
+    }
+  } catch {
+    // Keep the original message when it is not a JSON error response.
+  }
+  return error.message || 'Не удалось выполнить действие';
+}
+
+function toAccountOption(account: AccountProfilePublic): AccountOption {
+  const status = mapAccountStatus(account.status);
+
+  return {
+    active: account.is_active,
+    disabledReason: status === 'disabled' ? 'Профиль отключён' : undefined,
+    id: account.id,
+    maskedPhone: account.telegram_phone_masked || undefined,
+    name: accountName(account),
+    status,
+  };
+}
+
+function toPublicAccountProfile(account: AccountProfilePublic): PublicAccountProfile {
+  const status = mapAccountStatus(account.status);
+
+  return {
+    active: account.is_active,
+    disabledReason: status === 'disabled' ? 'Профиль отключён' : undefined,
+    enabled: status !== 'disabled',
+    id: account.id,
+    maskedPhone: account.telegram_phone_masked || undefined,
+    name: accountName(account),
+    sessionState: status === 'connected' ? 'authorized' : status === 'disabled' ? 'missing' : 'needs_auth',
+    status,
+  };
+}
+
+function getRunId(run: RunStatusSnapshot): string {
+  return run.kind === 'upload' ? run.run_id : run.probe_id;
+}
+
+function mapRunStatus(status: string): RunSummary['status'] {
+  if (status === 'running') return 'running';
+  if (status === 'cooldown') return 'cooldown';
+  if (status === 'paused' || status === 'rollback' || status === 'skipped_forward') return 'paused';
+  if (status === 'completed') return 'completed';
+  if (status === 'failed') return 'failed';
+  if (status === 'cancelled' || status === 'cancelled_replaced') return 'cancelled';
+  if (status === 'queued') return 'queued';
+  return 'blocked';
+}
+
+function formatSafeError(error: Record<string, unknown> | null | undefined): string | undefined {
+  if (!error) return undefined;
+  const message = error.message ?? error.detail ?? error.error;
+  if (typeof message === 'string' && message.trim()) return message;
+  return 'Backend сообщил об ошибке запуска.';
+}
+
+function toRunSummary(run: RunStatusSnapshot, accountNames: Map<string, string>): RunSummary {
+  const id = getRunId(run);
+  const accountNameValue = accountNames.get(run.account_profile_id) ?? run.account_profile_id;
+
+  if (run.kind === 'upload') {
+    const totalQuestions = Math.max(0, run.source_question_count);
+    const completedQuestions = Math.max(0, run.uploaded_count + run.skipped_count);
+    const progress = totalQuestions > 0 ? Math.round((completedQuestions / totalQuestions) * 100) : run.status === 'completed' ? 100 : 0;
+    const currentQuestion =
+      run.next_question_index <= totalQuestions
+        ? run.next_question_index
+        : totalQuestions > 0
+          ? totalQuestions
+          : undefined;
+
+    return {
+      accountName: accountNameValue,
+      autoResumeAttempts: run.auto_resume_attempts,
+      autoResumeDelaySeconds: run.auto_resume_delay_seconds,
+      autoResumeEnabled: run.auto_resume_enabled,
+      autoResumeLastScheduledAt: run.auto_resume_last_scheduled_at || undefined,
+      autoResumeNextAt: run.auto_resume_next_at || undefined,
+      completedQuestions,
+      currentQuestion,
+      estimatedRemainingSeconds: Math.max(0, Number(run.estimated_remaining_seconds) || 0),
+      id,
+      lastError: formatSafeError(run.last_error),
+      nextQuestionIndex: run.next_question_index,
+      progress,
+      quizTitle: run.quiz_name || run.quiz_file_basename,
+      rollbackTo: Math.max(1, run.next_question_index - 1),
+      startQuestionIndex: run.start_question_index,
+      status: mapRunStatus(run.status),
+      totalQuestions,
+      updatedAt: run.updated_at,
+    };
+  }
+
+  return {
+    accountName: accountNameValue,
+    completedQuestions: run.status === 'completed' ? 1 : 0,
+    id,
+    lastError: formatSafeError(run.last_error),
+    progress: run.status === 'completed' ? 100 : run.status === 'running' || run.status === 'cooldown' ? 50 : 0,
+    quizTitle: run.quiz_name || run.source_quiz_file_basename,
+    status: mapRunStatus(run.status),
+    totalQuestions: 1,
+    updatedAt: run.updated_at,
+  };
+}
+
+function uploadProgressFromPipeline(pipeline: PipelineState): { done: number; total: number; stage?: string } | null {
+  const value = pipeline.result?.upload_progress;
+  if (!value || typeof value !== 'object') return null;
+  const done = Number((value as Record<string, unknown>).done);
+  const total = Number((value as Record<string, unknown>).total);
+  const stage = (value as Record<string, unknown>).stage;
+  if (!Number.isFinite(done) || !Number.isFinite(total) || total < 0) return null;
+  return {
+    done: Math.max(0, done),
+    stage: typeof stage === 'string' ? stage : undefined,
+    total: Math.max(0, total),
+  };
+}
+
+function toDashboardRun(run: RunSummary | null): DashboardRunSummary | undefined {
+  if (!run) return undefined;
+  const dashboardStatus: DashboardRunSummary['status'] =
+    run.status === 'blocked' || run.status === 'cancelled'
+      ? 'failed'
+      : run.status === 'cooldown'
+        ? 'running'
+        : run.status;
+
+  return {
+    currentGroup: run.quizTitle,
+    currentStep: run.lastError ?? `Аккаунт: ${run.accountName}`,
+    progress: run.progress,
+    status: dashboardStatus,
+    title: run.quizTitle,
+  };
+}
+
+function pipelineToRunSummary(
+  pipeline: PipelineState,
+  group: QuizGroup | null,
+  accountNameValue: string,
+): RunSummary | null {
+  if (!pipeline.activeJobId) return null;
+
+  const runResult = pipeline.result?.run;
+  if (runResult && typeof runResult === 'object' && (runResult as Record<string, unknown>).kind === 'upload') {
+    const run = runResult as Record<string, unknown>;
+    const totalQuestions = Math.max(0, Number(run.source_question_count) || 0);
+    const completedQuestions = Math.max(0, (Number(run.uploaded_count) || 0) + (Number(run.skipped_count) || 0));
+    const nextQuestionIndex = Number(run.next_question_index) || undefined;
+    const progress = totalQuestions > 0
+      ? Math.round((Math.min(completedQuestions, totalQuestions) / totalQuestions) * 100)
+      : run.status === 'completed'
+        ? 100
+        : 0;
+    return {
+      accountName: accountNameValue,
+      completedQuestions,
+      currentQuestion: nextQuestionIndex && totalQuestions > 0 ? Math.min(nextQuestionIndex, totalQuestions) : undefined,
+      estimatedRemainingSeconds: Math.max(0, Number(run.estimated_remaining_seconds) || 0),
+      id: String(run.run_id),
+      lastError: formatSafeError(run.last_error as Record<string, unknown> | null | undefined),
+      nextQuestionIndex,
+      progress,
+      quizTitle: String(run.quiz_name || pipeline.currentGroup || group?.name || 'Новый запуск'),
+      rollbackTo: nextQuestionIndex ? Math.max(1, nextQuestionIndex - 1) : undefined,
+      startQuestionIndex: Number(run.start_question_index) || undefined,
+      status: mapRunStatus(String(run.status || 'running')),
+      totalQuestions,
+      updatedAt: typeof run.updated_at === 'string' ? run.updated_at : pipeline.currentStep || undefined,
+    };
+  }
+
+  const uploadProgress = uploadProgressFromPipeline(pipeline);
+  const totalQuestions = uploadProgress?.total || group?.questions.length || 0;
+  const completedQuestions = Math.min(totalQuestions, uploadProgress?.done ?? 0);
+  const progress = uploadProgress && totalQuestions > 0
+    ? Math.round((completedQuestions / totalQuestions) * 100)
+    : totalQuestions > 0
+      ? Math.round((completedQuestions / totalQuestions) * 100)
+    : Math.max(0, Math.min(100, Math.round(pipeline.progress)));
+  const currentQuestion = totalQuestions > 0
+    ? Math.max(1, Math.min(totalQuestions, completedQuestions + 1))
+    : undefined;
+  const status: RunSummary['status'] = pipeline.error
+    ? 'failed'
+    : pipeline.status === 'uploading'
+      ? 'running'
+      : progress >= 100
+        ? 'completed'
+        : 'queued';
+
+  return {
+    accountName: accountNameValue,
+    completedQuestions,
+    currentQuestion,
+    estimatedRemainingSeconds: pipeline.eta > 0 ? pipeline.eta : undefined,
+    id: pipeline.activeJobId,
+    lastError: pipeline.error,
+    progress,
+    quizTitle: pipeline.currentGroup || group?.name || 'Новый запуск',
+    status,
+    totalQuestions,
+    updatedAt: pipeline.currentStep || undefined,
+  };
+}
+
+function editorGroupToQuizGroup(group: QuizEditorGroup): QuizGroup {
+  return {
+    ...group,
+    date: group.date ?? '',
+    description: group.description ?? '',
+    questions: group.questions.map((question) => ({
+      ...question,
+      correct: typeof question.correct === 'number' ? question.correct : 0,
+      options: Array.isArray(question.options) ? question.options : [],
+      question: question.question ?? '',
+    })),
+    status: group.status === 'ready' || group.status === 'review' ? group.status : 'draft',
+  };
+}
+
+function settingsFromResponse(response: SettingsResponse | null, workspaceConfig: typeof defaultWorkspaceConfig): Partial<SettingsValues> {
+  return {
+    defaultLaunch: {
+      contextMode: 'per-question',
+      quizBotResponseSec: Math.max(0, Number(response?.eta?.bot_response_seconds) || 2),
+      segmentSize: 50,
+      shuffleOptions: false,
+      speed: 'normal',
+    },
+    workspaceLabel: response?.workspace_dir || workspaceConfig.workspaceDir,
+  };
+}
+
+function readStoredSettings(): Partial<SettingsValues> | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed as Partial<SettingsValues> : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredSettings(settings: SettingsValues | null) {
+  if (typeof window === 'undefined') return;
+  if (settings) {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    return;
+  }
+  window.localStorage.removeItem(SETTINGS_STORAGE_KEY);
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<string>('import');
+  const [activeRoute, setActiveRoute] = useState<AppRouteId>('dashboard');
   const [quizGroups, setQuizGroups] = useState<QuizGroup[]>([]);
-  const [sourceGroups, setSourceGroups] = useState<SourceGroupSummary[]>([]);
-  const [generationQueue, setGenerationQueue] = useState<SourceGroupSummary[]>([]);
   const [workspaceConfig, setWorkspaceConfig] = useState(defaultWorkspaceConfig);
   const [pipeline, setPipeline] = useState<PipelineState>(idlePipeline);
+  const [accounts, setAccounts] = useState<AccountProfilePublic[]>([]);
+  const [currentAccount, setCurrentAccount] = useState<AccountProfilePublic | null>(null);
+  const [runs, setRuns] = useState<RunStatusSnapshot[]>([]);
+  const [activeRun, setActiveRun] = useState<ActiveRunResponse>({ active: false });
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [storedSettings, setStoredSettings] = useState<Partial<SettingsValues> | null>(() => readStoredSettings());
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [selectedGroupId, setSelectedGroupId] = useState('');
+  const [telegramLogin, setTelegramLogin] = useState<TelegramLoginUiState | null>(null);
+  const [pendingEditorExit, setPendingEditorExit] = useState<QuizEditorExitRequest | null>(null);
+  const [archiveDeleteError, setArchiveDeleteError] = useState('');
+  const [archiveDeleteSubmitting, setArchiveDeleteSubmitting] = useState(false);
+  const modal = useModalStore();
   const activeEventSource = useRef<EventSource | null>(null);
   const activeJobStatus = useRef<TaskStatus>('idle');
+  const jobWatchGeneration = useRef(0);
+  const telegramLoginRequest = useRef(0);
 
   const refreshGroups = async () => {
     try {
       setQuizGroups(await api.getGroups());
     } catch (error) {
       console.error(error);
+      setQuizGroups([]);
     }
   };
 
-  const refreshSourceGroups = async () => {
+  const refreshAccounts = async () => {
+    const [accountsResult, currentResult] = await Promise.allSettled([
+      api.getAccounts(),
+      api.getCurrentAccount(),
+    ]);
+
+    const nextAccounts = accountsResult.status === 'fulfilled' ? accountsResult.value : [];
+    if (accountsResult.status === 'rejected') console.error(accountsResult.reason);
+    if (currentResult.status === 'rejected') console.error(currentResult.reason);
+
+    setAccounts(nextAccounts);
+    setCurrentAccount(
+      currentResult.status === 'fulfilled'
+        ? currentResult.value
+        : nextAccounts.find((account) => account.is_active) ?? null,
+    );
+  };
+
+  const refreshRuns = async () => {
+    const [runsResult, activeRunResult] = await Promise.allSettled([
+      api.getRuns(),
+      api.getActiveRun(),
+    ]);
+
+    if (runsResult.status === 'fulfilled') setRuns(runsResult.value);
+    else {
+      console.error(runsResult.reason);
+      setRuns([]);
+    }
+
+    if (activeRunResult.status === 'fulfilled') setActiveRun(activeRunResult.value);
+    else {
+      console.error(activeRunResult.reason);
+      setActiveRun({ active: false });
+    }
+  };
+
+  const refreshSettings = async () => {
     try {
-      setSourceGroups(await api.getSourceGroups());
+      const nextSettings = await api.getSettings();
+      setSettings(nextSettings);
+      setWorkspaceConfig((current) => ({
+        workspaceDir: nextSettings.workspace_dir || current.workspaceDir,
+        sourcePath: nextSettings.source_path || current.sourcePath,
+        outputDir: nextSettings.quizzes_dir || current.outputDir,
+        mediaRoot: nextSettings.media_dir || current.mediaRoot,
+      }));
     } catch (error) {
       console.error(error);
+      setSettings(null);
     }
   };
 
   useEffect(() => {
     refreshGroups();
-    refreshSourceGroups();
-    return () => activeEventSource.current?.close();
+    refreshAccounts();
+    refreshRuns();
+    refreshSettings();
+    return () => {
+      jobWatchGeneration.current += 1;
+      activeEventSource.current?.close();
+    };
   }, []);
 
   const applyJobEvent = (event: JobEvent) => {
@@ -87,12 +538,67 @@ export default function App() {
       activeEventSource.current?.close();
       activeEventSource.current = null;
       refreshGroups();
-      refreshSourceGroups();
+      refreshRuns();
     }
   };
 
-  const watchJob = (jobId: string, status: TaskStatus, groupName: string) => {
+  const applyJobSnapshot = (snapshot: JobSnapshot) => {
+    const running = snapshot.status === 'running';
+    const nextStatus = running ? taskStatusForJob(snapshot.type, activeJobStatus.current) : 'idle';
+    setPipeline((prev) => ({
+      ...prev,
+      status: nextStatus,
+      progress: snapshot.progress,
+      currentGroup: snapshot.current_group,
+      currentStep: snapshot.current_step,
+      eta: snapshot.eta,
+      logs: snapshot.logs.length > 0 ? snapshot.logs : prev.logs,
+      warningsFound: snapshot.warnings,
+      activeJobId: snapshot.id,
+      error: snapshot.error,
+      result: snapshot.result || prev.result,
+    }));
+
+    if (!running) {
+      activeEventSource.current?.close();
+      activeEventSource.current = null;
+      refreshGroups();
+      refreshRuns();
+    }
+  };
+
+  const recoverJobWithPolling = async (jobId: string, generation: number) => {
+    setPipeline((prev) => (
+      prev.activeJobId === jobId && prev.status !== 'idle'
+        ? { ...prev, currentStep: prev.currentStep || 'Ожидаем статус backend job...' }
+        : prev
+    ));
+
+    try {
+      const snapshot = await api.waitForJob(jobId);
+      if (jobWatchGeneration.current !== generation) return;
+      applyJobSnapshot(snapshot);
+    } catch (error) {
+      if (jobWatchGeneration.current !== generation) return;
+      setPipeline((prev) => (
+        prev.activeJobId === jobId
+          ? {
+              ...prev,
+              status: 'idle',
+              currentStep: 'Не удалось получить статус backend job.',
+              error: errorLabel(error),
+            }
+          : prev
+      ));
+      refreshGroups();
+      refreshRuns();
+    }
+  };
+
+  const watchJob = (jobId: string, status: TaskStatus, groupName: string, routeOnStart?: AppRouteId | null) => {
     activeEventSource.current?.close();
+    const generation = jobWatchGeneration.current + 1;
+    jobWatchGeneration.current = generation;
     activeJobStatus.current = status;
     setPipeline({
       ...idlePipeline,
@@ -101,18 +607,25 @@ export default function App() {
       currentStep: 'Подключение к backend job...',
       activeJobId: jobId,
     });
-    setActiveTab('monitor');
+    if (routeOnStart !== null) {
+      setActiveRoute(routeOnStart ?? (status === 'uploading' ? 'runs' : 'create'));
+    }
     activeEventSource.current = api.subscribeJob(
       jobId,
-      applyJobEvent,
+      (event) => {
+        if (jobWatchGeneration.current !== generation) return;
+        applyJobEvent(event);
+      },
       () => {
+        if (jobWatchGeneration.current !== generation) return;
         activeEventSource.current?.close();
         activeEventSource.current = null;
+        void recoverJobWithPolling(jobId, generation);
       },
     );
   };
 
-  const parseDocx = async (file: File, title: string, description: string, workspaceDir: string) => {
+  const createQuizFromDocx = async (file: File, title: string, description: string, workspaceDir: string, useAiParsing: boolean) => {
     const normalizedWorkspace = workspaceDir.trim() || '.';
     setWorkspaceConfig({
       workspaceDir: normalizedWorkspace,
@@ -120,90 +633,52 @@ export default function App() {
       outputDir: normalizedWorkspace === '.' ? 'quizzes' : `${normalizedWorkspace.replace(/[\\/]+$/, '')}/quizzes`,
       mediaRoot: normalizedWorkspace,
     });
-    const response = await api.parseDocx(file, title, description, normalizedWorkspace);
-    watchJob(response.job_id, 'parsing', title);
-  };
+    const response = await api.createQuizFromDocx(file, title, description, normalizedWorkspace, useAiParsing);
+    watchJob(response.job_id, 'parsing', title, 'create');
+    const snapshot = await api.waitForJob(response.job_id);
+    await refreshGroups();
+    if (snapshot.status === 'failed') {
+      throw new Error(snapshot.error || 'Не удалось создать JSON из DOCX');
+    }
 
-  const generateAllGroups = async (options: {
-    model: string;
-    outputDir: string;
-    mediaRoot: string;
-    styleExamples: number;
-    maxRetries: number;
-    groups?: string[];
-    skipExisting?: boolean;
-    sourcePath?: string;
-    workspaceDir?: string;
-  }) => {
-    setWorkspaceConfig((current) => ({
-      workspaceDir: options.workspaceDir || current.workspaceDir,
-      sourcePath: options.sourcePath || current.sourcePath,
-      outputDir: options.outputDir,
-      mediaRoot: options.mediaRoot,
-    }));
-    const response = await api.generateAllGroups({
-      source_path: options.sourcePath,
-      output_dir: options.outputDir,
-      groups: options.groups,
-      skip_existing: options.skipExisting ?? true,
-      model: options.model,
-      media_root: options.mediaRoot,
-      style_examples: options.styleExamples,
-      max_retries: options.maxRetries,
-    });
-    watchJob(response.job_id, 'normalizing', options.groups?.length ? 'Очередь генерации' : 'Все группы');
-  };
-
-  const generateAllGroupsWithDefaults = () =>
-    generateAllGroups({
-      model: 'gpt-4.1-mini',
-      outputDir: workspaceConfig.outputDir,
-      mediaRoot: workspaceConfig.mediaRoot,
-      styleExamples: 5,
-      maxRetries: 3,
-      sourcePath: workspaceConfig.sourcePath,
-      workspaceDir: workspaceConfig.workspaceDir,
-    });
-
-  const queueGroupForGeneration = (group: SourceGroupSummary) => {
-    if (group.generated) return;
-    setGenerationQueue((current) => (
-      current.some((item) => item.name === group.name) ? current : [...current, group]
+    const createdGroups = Array.isArray(snapshot.result?.groups) ? snapshot.result.groups : [];
+    const firstCreatedGroup = createdGroups.find((group): group is { id: string } => (
+      typeof group === 'object'
+      && group !== null
+      && typeof (group as { id?: unknown }).id === 'string'
     ));
+    if (firstCreatedGroup) {
+      setSelectedGroupId(firstCreatedGroup.id);
+    }
+    setActiveRoute('editor');
   };
 
-  const queueAllMissingGroups = () => {
-    setGenerationQueue((current) => {
-      const next = [...current];
-      sourceGroups
-        .filter((group) => !group.generated)
-        .forEach((group) => {
-          if (!next.some((item) => item.name === group.name)) next.push(group);
-        });
-      return next;
+  const createQuizFromJson = async (file: File, title: string, description: string, workspaceDir: string) => {
+    const normalizedWorkspace = workspaceDir.trim() || '.';
+    setWorkspaceConfig({
+      workspaceDir: normalizedWorkspace,
+      sourcePath: normalizedWorkspace === '.' ? 'questions_v2.json' : `${normalizedWorkspace.replace(/[\\/]+$/, '')}/questions_v2.json`,
+      outputDir: normalizedWorkspace === '.' ? 'quizzes' : `${normalizedWorkspace.replace(/[\\/]+$/, '')}/quizzes`,
+      mediaRoot: normalizedWorkspace,
     });
+    const saved = await api.importQuizJson(file, title.trim() || file.name.replace(/\.[^.]+$/, ''), description, normalizedWorkspace);
+    setQuizGroups((current) => [saved, ...current.filter((group) => group.id !== saved.id)]);
+    setSelectedGroupId(saved.id);
+    setActiveRoute('editor');
   };
 
-  const removeQueuedGroup = (groupName: string) => {
-    setGenerationQueue((current) => current.filter((group) => group.name !== groupName));
-  };
-
-  const clearGenerationQueue = () => setGenerationQueue([]);
-
-  const startGenerationQueue = async () => {
-    if (generationQueue.length === 0) return;
-    await generateAllGroups({
-      model: 'gpt-4.1-mini',
-      outputDir: workspaceConfig.outputDir,
-      mediaRoot: workspaceConfig.mediaRoot,
-      styleExamples: 5,
-      maxRetries: 3,
-      groups: generationQueue.map((group) => group.name),
-      skipExisting: true,
-      sourcePath: workspaceConfig.sourcePath,
-      workspaceDir: workspaceConfig.workspaceDir,
+  const createManualQuiz = async (title: string, workspaceDir: string) => {
+    const normalizedWorkspace = workspaceDir.trim() || '.';
+    setWorkspaceConfig({
+      workspaceDir: normalizedWorkspace,
+      sourcePath: normalizedWorkspace === '.' ? 'questions_v2.json' : `${normalizedWorkspace.replace(/[\\/]+$/, '')}/questions_v2.json`,
+      outputDir: normalizedWorkspace === '.' ? 'quizzes' : `${normalizedWorkspace.replace(/[\\/]+$/, '')}/quizzes`,
+      mediaRoot: normalizedWorkspace,
     });
-    setGenerationQueue([]);
+    const saved = await api.createManualQuiz(title.trim() || 'Новый квиз', normalizedWorkspace);
+    setQuizGroups((current) => [saved, ...current.filter((group) => group.id !== saved.id)]);
+    setSelectedGroupId(saved.id);
+    setActiveRoute('editor');
   };
 
   const validateGroup = async (groupId: string, strict: boolean): Promise<ValidationReport> => {
@@ -220,32 +695,19 @@ export default function App() {
     groupId: string;
     name: string;
     speed: 'normal' | 'fast';
-    contextMode: 'once' | 'per_question';
+    contextMode: 'once' | 'per-question';
     shuffleOptions: boolean;
+    startFrom?: number;
   }) => {
     const response = await api.uploadGroup({
       group_id: options.groupId,
       name: options.name,
       speed: options.speed,
-      context_send_mode: options.contextMode === 'per_question' ? 'per-question' : 'once',
+      context_send_mode: options.contextMode,
       shuffle_options: options.shuffleOptions,
+      start_from: options.startFrom ?? 1,
     });
-    watchJob(response.job_id, 'uploading', options.name);
-  };
-
-  const uploadQueue = async (options: {
-    items: Array<{ groupId: string; name: string }>;
-    speed: 'normal' | 'fast';
-    contextMode: 'once' | 'per_question';
-    shuffleOptions: boolean;
-  }) => {
-    const response = await api.uploadQueue({
-      items: options.items.map((item) => ({ group_id: item.groupId, name: item.name })),
-      speed: options.speed,
-      context_send_mode: options.contextMode === 'per_question' ? 'per-question' : 'once',
-      shuffle_options: options.shuffleOptions,
-    });
-    watchJob(response.job_id, 'uploading', `Очередь Telegram (${options.items.length})`);
+    watchJob(response.job_id, 'uploading', options.name, 'runs');
   };
 
   const cancelPipeline = async () => {
@@ -253,18 +715,43 @@ export default function App() {
     await api.cancelJob(pipeline.activeJobId);
   };
 
-  const handleTabChange = (tabId: string) => {
-    if (pipeline.status !== 'idle' && tabId !== 'monitor') {
-      alert(`Запущен фоновый процесс. Следите за прогрессом во вкладке "Мониторинг задач".`);
-      setActiveTab('monitor');
-      return;
-    }
-    setActiveTab(tabId);
-  };
-
   const handleUpdateGroup = async (groupId: string, updatedGroup: QuizGroup) => {
     const saved = await api.saveGroup({ ...updatedGroup, id: groupId });
     setQuizGroups((groups) => groups.map((group) => (group.id === groupId ? saved : group)));
+  };
+
+  const handleSaveSettings = async (nextSettings: SettingsValues) => {
+    setSettingsSaving(true);
+    try {
+      const etaResponse = await api.updateEtaSettings({
+        bot_response_seconds: nextSettings.defaultLaunch.quizBotResponseSec,
+      });
+      setStoredSettings(nextSettings);
+      writeStoredSettings(nextSettings);
+      setSettings((current) => current ? { ...current, eta: { ...(current.eta || {}), ...etaResponse.eta } } : current);
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
+  const handleResetSettings = () => {
+    setStoredSettings(null);
+    writeStoredSettings(null);
+  };
+
+  const saveEditorGroup = async (groupId: string, updatedGroup: QuizEditorGroup) => {
+    await handleUpdateGroup(groupId, editorGroupToQuizGroup(updatedGroup));
+  };
+
+  const validateEditorGroup = async (groupId: string, updatedGroup: QuizEditorGroup) => {
+    await saveEditorGroup(groupId, updatedGroup);
+    return validateGroup(groupId, true);
+  };
+
+  const markEditorGroupReady = async (groupId: string, updatedGroup: QuizEditorGroup) => {
+    await saveEditorGroup(groupId, updatedGroup);
+    setSelectedGroupId(groupId);
+    setActiveRoute('runs');
   };
 
   const uploadMedia = async (file: File): Promise<string> => {
@@ -272,119 +759,654 @@ export default function App() {
     return uploaded.path;
   };
 
+  const effectiveAccount = currentAccount ?? accounts.find((account) => account.is_active) ?? null;
+  const effectiveAccountStatus = mapAccountStatus(effectiveAccount?.status ?? '');
+  const accountOptions = useMemo(() => accounts.map(toAccountOption), [accounts]);
+  const publicAccounts = useMemo(() => accounts.map(toPublicAccountProfile), [accounts]);
+  const effectiveSettings = useMemo(
+    () => {
+      const responseSettings = settingsFromResponse(settings, workspaceConfig);
+      return {
+        ...responseSettings,
+        ...(storedSettings || {}),
+        defaultLaunch: {
+          ...responseSettings.defaultLaunch,
+          ...(storedSettings?.defaultLaunch || {}),
+        },
+      };
+    },
+    [settings, storedSettings, workspaceConfig],
+  );
+  const accountNames = useMemo(
+    () => new Map(accounts.map((account) => [account.id, accountName(account)])),
+    [accounts],
+  );
+
+  const runSummaries = useMemo(
+    () => runs.map((run) => toRunSummary(run, accountNames)),
+    [accountNames, runs],
+  );
+
+  const activeRunSummary = useMemo(() => {
+    if (activeRun.active) return toRunSummary(activeRun, accountNames);
+    return runSummaries.find((run) => run.status === 'running' || run.status === 'cooldown' || run.status === 'paused') ?? null;
+  }, [accountNames, activeRun, runSummaries]);
+
+  const pausableRunIds = useMemo(() => {
+    const ids = new Set<string>();
+    runs.forEach((run) => {
+      if (run.kind === 'upload') ids.add(run.run_id);
+    });
+    if (activeRun.active && activeRun.kind === 'upload') ids.add(activeRun.run_id);
+    return ids;
+  }, [activeRun, runs]);
+
+  const dashboardRows = useMemo<DashboardQuizRow[]>(() => {
+    if (quizGroups.length === 0) {
+      return [
+        {
+          action: 'parse',
+          actionLabel: 'Создать',
+          errors: '-',
+          name: 'Квизы не загружены',
+          stage: 'Backend',
+          status: 'Нет данных',
+          tone: 'neutral',
+        },
+      ];
+    }
+
+    return quizGroups.slice(0, 5).map(rowFromQuizGroup);
+  }, [quizGroups]);
+
   const isLocked = pipeline.status !== 'idle';
+  const dashboardCurrentRun = isLocked ? undefined : toDashboardRun(activeRunSummary);
+  const selectedQuizGroup = quizGroups.find((group) => group.id === selectedGroupId) ?? quizGroups[0] ?? null;
+  const pipelineRunSummary = activeJobStatus.current === 'uploading'
+    ? pipelineToRunSummary(pipeline, selectedQuizGroup, accountName(effectiveAccount))
+    : null;
+  const runsCurrentRun = pipelineRunSummary ?? activeRunSummary;
+  const pipelineRunHasBackendRun = Boolean(pipelineRunSummary && pipelineRunSummary.id !== pipeline.activeJobId);
+  const runsControlsEnabled = Boolean(
+    pipelineRunSummary
+      ? pipelineRunHasBackendRun
+      : activeRunSummary && pausableRunIds.has(activeRunSummary.id),
+  );
+  const launchQuizCandidate: LaunchQuizCandidate | null = selectedQuizGroup
+    ? {
+        disabledReason:
+          isLocked
+            ? 'Дождитесь завершения текущей задачи.'
+            : effectiveAccountStatus !== 'connected'
+              ? 'Подключите аккаунт запуска перед стартом.'
+              : selectedQuizGroup.status !== 'ready'
+                ? 'Сначала проверьте JSON и исправьте ошибки в редакторе.'
+                : undefined,
+        id: selectedQuizGroup.id,
+        name: selectedQuizGroup.name,
+        questionCount: selectedQuizGroup.questions.length,
+        status: selectedQuizGroup.status,
+      }
+    : null;
+
+  const handleAccountChange = () => {
+    if (accountOptions.length === 0) {
+      setActiveRoute('accounts');
+      return;
+    }
+
+    openModal('switch-account', {
+      accounts: accountOptions,
+      activeAccountId: effectiveAccount?.id,
+      manageAccountsDisabled: false,
+    });
+  };
+
+  const switchAccount = async (accountId: string) => {
+    try {
+      const nextAccount = await api.setCurrentAccount(accountId);
+      setCurrentAccount(nextAccount);
+      setAccounts((current) => (
+        current.map((account) => ({ ...account, is_active: account.id === nextAccount.id }))
+      ));
+      closeModal();
+      refreshAccounts();
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const handleSetActiveAccount = (account: PublicAccountProfile) => {
+    void switchAccount(account.id);
+  };
+
+  const showTelegramLoginError = (accountNameValue: string, error: unknown) => {
+    const label = errorLabel(error);
+    openModal('telegram-error', {
+      accountName: accountNameValue,
+      canOpenAccounts: true,
+      canReconnect: false,
+      canRetryLater: false,
+      errorLabel: label,
+      kind: 'unknown',
+      recommendation: 'Проверьте профиль аккаунта и повторите вход.',
+    });
+    return label;
+  };
+
+  const handleStartLaunchQuiz = async (quiz: LaunchQuizCandidate, startFrom = 1) => {
+    const group = quizGroups.find((item) => item.id === quiz.id);
+    if (!group) return;
+
+    if (group.status !== 'ready') {
+      setSelectedGroupId(group.id);
+      setActiveRoute('editor');
+      return;
+    }
+
+    if (effectiveAccountStatus !== 'connected') {
+      setActiveRoute('accounts');
+      return;
+    }
+
+    try {
+      const launchDefaults = effectiveSettings.defaultLaunch;
+      await uploadGroup({
+        contextMode: launchDefaults.contextMode,
+        groupId: group.id,
+        name: group.name,
+        shuffleOptions: launchDefaults.shuffleOptions,
+        speed: launchDefaults.speed,
+        startFrom,
+      });
+    } catch (error) {
+      showTelegramLoginError(accountName(effectiveAccount), error);
+    }
+  };
+
+  const handleEnableAccount = async (account: PublicAccountProfile) => {
+    const updated = await api.enableAccount(account.id);
+    setAccounts((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+    if (updated.is_active) setCurrentAccount(updated);
+    await refreshAccounts();
+  };
+
+  const handleDisableAccount = async (account: PublicAccountProfile) => {
+    const updated = await api.disableAccount(account.id);
+    setAccounts((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+    if (updated.is_active) setCurrentAccount(updated);
+    else if (currentAccount?.id === updated.id) setCurrentAccount(null);
+    await refreshAccounts();
+  };
+
+  const handleDeleteAccount = async (account: PublicAccountProfile) => {
+    const result = await api.deleteAccount(account.id);
+    setAccounts((current) => current.filter((item) => item.id !== account.id));
+    setCurrentAccount(result.active_account);
+    if (telegramLogin?.profileId === account.id) setTelegramLogin(null);
+    await refreshAccounts();
+  };
+
+  const completeTelegramLogin = async (account: AccountProfilePublic) => {
+    setAccounts((current) => {
+      const exists = current.some((item) => item.id === account.id);
+      if (!exists) return [...current, account];
+      return current.map((item) => (item.id === account.id ? account : item));
+    });
+    if (account.is_active) setCurrentAccount(account);
+    setTelegramLogin(null);
+    await refreshAccounts();
+  };
+
+  const handleStartTelegramLogin = async (
+    account: PublicAccountProfile,
+    options: { force?: boolean; forceSms?: boolean } = {},
+  ) => {
+    if (
+      !options.force
+      && (
+        telegramLogin?.profileId === account.id
+        && !telegramLogin.error
+        && (telegramLogin.loading || telegramLogin.step === 'code_sent' || telegramLogin.step === 'password_required')
+      )
+    ) {
+      setActiveRoute('accounts');
+      return;
+    }
+    const requestId = telegramLoginRequest.current + 1;
+    telegramLoginRequest.current = requestId;
+    setActiveRoute('accounts');
+    setTelegramLogin({
+      accountName: account.name,
+      loading: true,
+      profileId: account.id,
+      step: 'starting',
+    });
+
+    try {
+      const response = await api.startTelegramLogin(account.id, {
+        forceSms: options.forceSms,
+      });
+      if (telegramLoginRequest.current !== requestId) return;
+      if (response.step === 'authorized') {
+        await completeTelegramLogin(response.account);
+        return;
+      }
+      setTelegramLogin({
+        accountName: account.name,
+        loading: false,
+        loginId: response.login_id,
+        phoneMasked: response.phone_masked,
+        profileId: account.id,
+        step: response.step,
+      });
+    } catch (error) {
+      if (telegramLoginRequest.current !== requestId) return;
+      const label = errorLabel(error);
+      setTelegramLogin((current) => (
+        current?.profileId === account.id
+          ? { ...current, error: label, loading: false }
+          : current
+      ));
+    }
+  };
+
+  const handleSubmitTelegramCode = async (code: string) => {
+    if (!telegramLogin?.loginId) return;
+    const currentLogin = telegramLogin;
+    setTelegramLogin({ ...currentLogin, error: undefined, loading: true });
+
+    try {
+      const response = await api.submitTelegramCode(currentLogin.loginId, code);
+      if (response.step === 'authorized') {
+        await completeTelegramLogin(response.account);
+        return;
+      }
+      setTelegramLogin({
+        ...currentLogin,
+        error: undefined,
+        loading: false,
+        step: 'password_required',
+      });
+    } catch (error) {
+      const label = errorLabel(error);
+      setTelegramLogin({ ...currentLogin, error: label, loading: false });
+    }
+  };
+
+  const handleSubmitTelegramPassword = async (password: string) => {
+    if (!telegramLogin?.loginId) return;
+    const currentLogin = telegramLogin;
+    setTelegramLogin({ ...currentLogin, error: undefined, loading: true });
+
+    try {
+      const response = await api.submitTelegramPassword(currentLogin.loginId, password);
+      await completeTelegramLogin(response.account);
+    } catch (error) {
+      const label = errorLabel(error);
+      setTelegramLogin({ ...currentLogin, error: label, loading: false });
+    }
+  };
+
+  const handleRestartTelegramLogin = () => {
+    if (!telegramLogin) return;
+    const account = publicAccounts.find((item) => item.id === telegramLogin.profileId);
+    if (!account) return;
+    void handleStartTelegramLogin(account, { force: true });
+  };
+
+  const handleCancelTelegramLogin = async () => {
+    telegramLoginRequest.current += 1;
+    const loginId = telegramLogin?.loginId;
+    setTelegramLogin(null);
+    if (!loginId) return;
+    try {
+      await api.cancelTelegramLogin(loginId);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const handleDashboardQuizAction = (row: DashboardQuizRow, action: DashboardQuizAction) => {
+    if (row.id) setSelectedGroupId(row.id);
+    if (action === 'parse') setActiveRoute('create');
+    if (action === 'launch' || action === 'remove') setActiveRoute('runs');
+    if (action === 'fix' || action === 'edit' || action === 'open') setActiveRoute('editor');
+  };
+
+  const selectQuizAndOpen = (quiz: QuizListItem, routeId: AppRouteId) => {
+    setSelectedGroupId(quiz.id);
+    setActiveRoute(routeId);
+  };
+
+  const openArchiveDeleteQuiz = (quiz: QuizListItem, defaultAction: 'archive' | 'delete') => {
+    const group = quizGroups.find((item) => item.id === quiz.id);
+    const questionCount = group?.questions.length ?? (typeof quiz.questions === 'number' ? quiz.questions : 0);
+
+    setArchiveDeleteError('');
+    setArchiveDeleteSubmitting(false);
+    openModal('archive-delete-quiz', {
+      allowArchive: true,
+      allowHardDelete: true,
+      defaultAction,
+      questionCount,
+      quizId: quiz.id,
+      quizTitle: group?.name ?? quiz.name,
+    });
+  };
+
+  const confirmArchiveDeleteQuiz = async ({ quizId, action }: { quizId: string; action: 'archive' | 'delete' }) => {
+    if (archiveDeleteSubmitting) return;
+    setArchiveDeleteError('');
+    setArchiveDeleteSubmitting(true);
+    try {
+      if (action === 'archive') await api.archiveGroup(quizId);
+      else await api.deleteGroup(quizId);
+
+      const nextGroups = quizGroups.filter((group) => group.id !== quizId);
+      setQuizGroups(nextGroups);
+      if (selectedGroupId === quizId) {
+        setSelectedGroupId(nextGroups[0]?.id ?? '');
+      }
+      closeCurrentModal();
+      await refreshGroups();
+    } catch (error) {
+      console.error(error);
+      setArchiveDeleteError(errorLabel(error));
+    } finally {
+      setArchiveDeleteSubmitting(false);
+    }
+  };
+
+  const handlePauseRun = async (run: RunSummary) => {
+    const isCurrentPipelineRun = Boolean(pipelineRunSummary && pipelineRunSummary.id === run.id && pipelineRunHasBackendRun);
+    if (!pausableRunIds.has(run.id) && !isCurrentPipelineRun) return;
+
+    try {
+      await api.pauseRun(run.id);
+      await refreshRuns();
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const handleResumeRun = async (run: RunSummary) => {
+    const isCurrentPipelineRun = Boolean(pipelineRunSummary && pipelineRunSummary.id === run.id && pipelineRunHasBackendRun);
+    if (!pausableRunIds.has(run.id) && !isCurrentPipelineRun) return;
+
+    try {
+      const response = await api.resumeRun(run.id);
+      watchJob(response.job_id, 'uploading', run.quizTitle, 'runs');
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const handleContinueRun = async (run: RunSummary, questionIndex: number) => {
+    try {
+      const launchDefaults = effectiveSettings.defaultLaunch;
+      const response = await api.continueRun(run.id, questionIndex, {
+        confirmSkipForward: questionIndex > (run.nextQuestionIndex ?? run.currentQuestion ?? 1),
+        contextSendMode: launchDefaults.contextMode,
+        shuffleOptions: launchDefaults.shuffleOptions,
+        speed: launchDefaults.speed,
+      });
+      watchJob(response.job_id, 'uploading', run.quizTitle, 'runs');
+    } catch (error) {
+      console.error(error);
+      throw error;
+    }
+  };
+
+  const handleStopRun = (run: RunSummary) => {
+    openModal('stop-run', {
+      accountName: run.accountName,
+      canStop: true,
+      completedQuestions: run.completedQuestions ?? Math.round((run.progress / 100) * run.totalQuestions),
+      quizTitle: run.quizTitle,
+      runId: run.id,
+      totalQuestions: run.totalQuestions,
+    });
+  };
+
+  const handleUpdateRunAutoResume = async (run: RunSummary, enabled: boolean, delaySeconds: number) => {
+    try {
+      const updated = await api.updateRunAutoResume(run.id, { delaySeconds, enabled });
+      setRuns((current) => current.map((item) => (
+        item.kind === 'upload' && item.run_id === run.id ? updated : item
+      )));
+      if (activeRun.active && activeRun.kind === 'upload' && activeRun.run_id === run.id) {
+        setActiveRun({ ...updated, active: true });
+      }
+    } catch (error) {
+      console.error(error);
+      throw error;
+    }
+  };
+
+  const confirmStopRun = async (runId: string) => {
+    try {
+      if (pipeline.activeJobId === runId) {
+        await api.cancelJob(runId);
+      } else {
+        await api.stopRun(runId);
+      }
+      closeCurrentModal();
+      await refreshRuns();
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const handleEditorExitRequest = (request: QuizEditorExitRequest) => {
+    if (!request.hasUnsavedChanges) {
+      request.proceed();
+      return;
+    }
+
+    setPendingEditorExit(request);
+    openModal('unsaved-changes', {
+      canSave: false,
+      changedQuestionsCount: 1,
+      lastAutosaveLabel: 'ручное сохранение доступно в редакторе',
+      quizTitle: selectedQuizGroup?.name ?? 'квиз',
+    });
+  };
+
+  const discardEditorChanges = () => {
+    pendingEditorExit?.proceed();
+    setPendingEditorExit(null);
+    closeModal();
+  };
+
+  const closeCurrentModal = () => {
+    setPendingEditorExit(null);
+    setArchiveDeleteError('');
+    setArchiveDeleteSubmitting(false);
+    closeModal();
+  };
+
+  const activeScreen = (() => {
+    switch (activeRoute) {
+      case 'create':
+        return (
+          <CreateQuizScreen
+            initialValues={{
+              workspaceDir: workspaceConfig.workspaceDir,
+            }}
+            jobError={pipeline.error}
+            jobProgress={pipeline.progress}
+            jobStep={pipeline.currentStep}
+            onCancel={() => setActiveRoute('dashboard')}
+            onCreateFromDocx={createQuizFromDocx}
+            onCreateFromJson={createQuizFromJson}
+            onCreateManual={createManualQuiz}
+            status={pipeline.status}
+          />
+        );
+      case 'editor':
+        return (
+          <QuizEditorScreen
+            isLocked={isLocked}
+            onReadyForLaunch={markEditorGroupReady}
+            onRequestExit={handleEditorExitRequest}
+            onSelectedGroupChange={setSelectedGroupId}
+            onValidateJson={validateEditorGroup}
+            quizGroup={selectedQuizGroup}
+            quizGroups={quizGroups}
+            resolveMediaUrl={mediaUrl}
+            saveQuizGroup={saveEditorGroup}
+            selectedGroupId={selectedGroupId}
+            updateQuizGroup={saveEditorGroup}
+            uploadMedia={uploadMedia}
+          />
+        );
+      case 'quizzes':
+        return (
+          <QuizzesScreen
+            onCreateQuiz={() => setActiveRoute('create')}
+            onArchiveQuiz={(quiz) => openArchiveDeleteQuiz(quiz, 'archive')}
+            onDeleteQuiz={(quiz) => openArchiveDeleteQuiz(quiz, 'delete')}
+            onEditQuiz={(quiz) => selectQuizAndOpen(quiz, 'editor')}
+            onLaunchQuiz={(quiz) => selectQuizAndOpen(quiz, 'runs')}
+            onOpenQuiz={(quiz) => selectQuizAndOpen(quiz, 'editor')}
+            onParseQuiz={() => setActiveRoute('create')}
+            quizGroups={quizGroups}
+          />
+        );
+      case 'runs':
+        return (
+          <RunsScreen
+            controlsEnabled={runsControlsEnabled}
+            currentRun={runsCurrentRun}
+            dangerousActionsEnabled={Boolean(runsCurrentRun)}
+            launchQuiz={launchQuizCandidate}
+            onStartLaunchQuiz={handleStartLaunchQuiz}
+            onContinueRun={handleContinueRun}
+            onPauseRun={handlePauseRun}
+            onResumeRun={handleResumeRun}
+            onStopRun={handleStopRun}
+            onUpdateRunAutoResume={handleUpdateRunAutoResume}
+            queueActionsEnabled={false}
+            runs={runSummaries}
+          />
+        );
+      case 'accounts':
+        return (
+          <AccountsScreen
+            accounts={publicAccounts}
+            connectionActionsEnabled
+            onCancelTelegramLogin={handleCancelTelegramLogin}
+            onConnectAccount={handleStartTelegramLogin}
+            onDeleteAccount={handleDeleteAccount}
+            onDisableAccount={handleDisableAccount}
+            onEnableAccount={handleEnableAccount}
+            onReconnectAccount={handleStartTelegramLogin}
+            onRestartTelegramLogin={handleRestartTelegramLogin}
+            onSetActiveAccount={handleSetActiveAccount}
+            onSubmitTelegramCode={handleSubmitTelegramCode}
+            onSubmitTelegramPassword={handleSubmitTelegramPassword}
+            managementEnabled
+            switchEnabled={publicAccounts.length > 0}
+            telegramLogin={telegramLogin}
+          />
+        );
+      case 'settings':
+        return (
+          <SettingsScreen
+            onResetSettings={handleResetSettings}
+            onSaveSettings={handleSaveSettings}
+            saving={settingsSaving}
+            settings={effectiveSettings}
+            storageActionsEnabled={false}
+          />
+        );
+      case 'dashboard':
+      default:
+        return (
+          <DashboardScreen
+            currentRun={dashboardCurrentRun}
+            isLocked={isLocked}
+            onCreateQuiz={() => setActiveRoute('create')}
+            onEditQueue={() => setActiveRoute('runs')}
+            onNavigate={setActiveRoute}
+            onOpenEditor={selectedQuizGroup ? () => setActiveRoute('editor') : undefined}
+            onOpenRuns={() => setActiveRoute('runs')}
+            onQuizAction={handleDashboardQuizAction}
+            pipeline={pipeline}
+            rows={dashboardRows}
+          />
+        );
+    }
+  })();
+
+  void cancelPipeline;
 
   return (
-    <div className="flex bg-slate-50 min-h-screen text-slate-800 antialiased font-sans">
-      <Sidebar
-        activeTab={activeTab}
-        setActiveTab={handleTabChange}
-        status={pipeline.status}
-        currentStep={pipeline.currentStep}
-      />
+    <AppShell
+      activeRoute={activeRoute}
+      activeAccountName={accountName(effectiveAccount)}
+      currentStep={pipeline.currentStep}
+      isLocked={isLocked}
+      onAccountChange={handleAccountChange}
+      onNavigate={setActiveRoute}
+    >
+      {activeScreen}
 
-      <main className="flex-1 flex flex-col min-w-0 max-w-7xl mx-auto">
-        <header className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between shrink-0 select-none shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
-          <h2 className="text-sm font-bold text-slate-800 tracking-tight flex items-center gap-2">
-            <span>Панель управления</span>
-            <span className="text-slate-300 text-xs">/</span>
-            <span className="text-slate-500 font-medium font-sans">
-              {activeTab === 'import' && 'Шаг 1: Загрузка и первичный парсинг'}
-              {activeTab === 'monitor' && 'Шаг 2: Мониторинг фоновых процессов'}
-              {activeTab === 'editor' && 'Шаг 3: Визуальный редактор квизов'}
-              {activeTab === 'deploy' && 'Шаг 4: Деплой и загрузка'}
-            </span>
-          </h2>
+      {modal.modalId === 'switch-account' && (
+        <SwitchAccountModal
+          isOpen
+          onClose={closeCurrentModal}
+          onConfirm={switchAccount}
+          onManageAccounts={() => {
+            closeCurrentModal();
+            setActiveRoute('accounts');
+          }}
+          payload={modal.payload}
+        />
+      )}
 
-          <div className="flex items-center gap-4">
-            {isLocked ? (
-              <div className="flex items-center gap-2 text-xs font-semibold px-4 py-1.5 rounded-xl bg-amber-500/10 text-amber-700 border border-amber-500/20 animate-pulse">
-                <Loader2 size={14} className="animate-spin text-amber-600" />
-                <span className="font-sans font-bold">ВЫПОЛНЯЕТСЯ BACKEND JOB...</span>
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 text-xs font-semibold px-4 py-1.5 rounded-xl bg-emerald-500/10 text-emerald-800 border border-emerald-500/20">
-                <ShieldCheck size={14} className="text-emerald-600" />
-                <span>ОЧЕРЕДЬ СВОБОДНА</span>
-              </div>
-            )}
-            <div className="h-6 w-px bg-slate-200" />
-            <div className="text-[11px] font-mono text-slate-450 text-right shrink-0">
-              <span className="block text-slate-400">API: LOCALHOST</span>
-              <span className="block font-bold text-indigo-600">PORT 8000</span>
-            </div>
-          </div>
-        </header>
+      {modal.modalId === 'unsaved-changes' && (
+        <UnsavedChangesModal
+          isOpen
+          onClose={closeCurrentModal}
+          onDiscard={discardEditorChanges}
+          onStay={closeCurrentModal}
+          payload={modal.payload}
+        />
+      )}
 
-        <section className="flex-1 p-8 overflow-y-auto space-y-6">
-          {isLocked && activeTab !== 'monitor' && (
-            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 flex items-center justify-between gap-4 animate-slideDown shadow-sm">
-              <div className="flex items-start gap-3">
-                <div className="p-2 bg-amber-100 rounded-xl text-amber-700 shrink-0">
-                  <Lock size={16} />
-                </div>
-                <div>
-                  <h4 className="font-bold text-amber-800 text-sm">Глобальный замок состояния</h4>
-                  <p className="text-xs text-amber-600 leading-relaxed mt-0.5">
-                    Backend job выполняется прямо сейчас. Повторные запуски и редактирование заблокированы до завершения.
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setActiveTab('monitor')}
-                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-xl shadow-md shadow-amber-600/15 transition flex items-center gap-1 shrink-0"
-              >
-                <span>В терминал логов</span>
-                <Play size={10} className="fill-current text-white shrink-0" />
-              </button>
-            </div>
-          )}
+      {modal.modalId === 'telegram-error' && (
+        <TelegramErrorModal
+          isOpen
+          onClose={closeCurrentModal}
+          onOpenAccounts={() => {
+            closeCurrentModal();
+            setActiveRoute('accounts');
+          }}
+          payload={modal.payload}
+        />
+      )}
 
-          <div className={`${isLocked && activeTab !== 'monitor' ? 'pointer-events-none opacity-50 select-none' : ''} transition-all`}>
-            {activeTab === 'import' && (
-              <ImportScreen
-                status={pipeline.status}
-                onParseDocx={parseDocx}
-                onGenerateAllGroups={generateAllGroups}
-              />
-            )}
-            {activeTab === 'monitor' && (
-              <MonitorScreen
-                pipeline={pipeline}
-                cancelPipeline={cancelPipeline}
-                setActiveTab={setActiveTab}
-                onGenerateAllGroups={generateAllGroupsWithDefaults}
-              />
-            )}
-            {activeTab === 'editor' && (
-              <EditorScreen
-                status={pipeline.status}
-                quizGroups={quizGroups}
-                sourceGroups={sourceGroups}
-                generationQueue={generationQueue}
-                onGenerateAllGroups={generateAllGroupsWithDefaults}
-                queueGroupForGeneration={queueGroupForGeneration}
-                queueAllMissingGroups={queueAllMissingGroups}
-                removeQueuedGroup={removeQueuedGroup}
-                clearGenerationQueue={clearGenerationQueue}
-                startGenerationQueue={startGenerationQueue}
-                uploadMedia={uploadMedia}
-                updateQuizGroup={handleUpdateGroup}
-              />
-            )}
-            {activeTab === 'deploy' && (
-              <DeployScreen
-                status={pipeline.status}
-                quizGroups={quizGroups}
-                validateGroup={validateGroup}
-                uploadGroup={uploadGroup}
-                uploadQueue={uploadQueue}
-                updateQuizGroup={handleUpdateGroup}
-              />
-            )}
-          </div>
-        </section>
-      </main>
-    </div>
+      {modal.modalId === 'stop-run' && (
+        <StopRunModal
+          isOpen
+          onClose={closeCurrentModal}
+          onConfirm={confirmStopRun}
+          payload={modal.payload}
+        />
+      )}
+
+      {modal.modalId === 'archive-delete-quiz' && (
+        <ArchiveDeleteQuizModal
+          error={archiveDeleteError}
+          isOpen
+          isSubmitting={archiveDeleteSubmitting}
+          onClose={closeCurrentModal}
+          onConfirm={confirmArchiveDeleteQuiz}
+          payload={modal.payload}
+        />
+      )}
+    </AppShell>
   );
 }

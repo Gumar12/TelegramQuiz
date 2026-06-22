@@ -100,6 +100,60 @@ def test_upload_question_clicks_create_then_sends_context_and_media_before_poll(
     assert client.calls[4][0] == "poll"
 
 
+def test_upload_question_continues_when_prelude_already_exists(monkeypatch):
+    class FakeMessage:
+        def __init__(self, text, buttons=None):
+            self.text = text
+            self.buttons = buttons
+
+    class FakeClient:
+        def __init__(self):
+            create_question_button = type("Button", (), {"text": BTN_CREATE_QUESTION})()
+            self.calls = []
+            self.last_reply = FakeMessage(
+                BOT_PROMPTS["ask_next_question"],
+                buttons=[[create_question_button]],
+            )
+            self.replies = [
+                FakeMessage(
+                    BOT_PROMPTS["prelude_already_set"],
+                    buttons=[[create_question_button]],
+                ),
+                FakeMessage(BOT_PROMPTS["ask_next_question"]),
+            ]
+
+        async def send_text(self, text):
+            self.calls.append(("text", text))
+            return object()
+
+        async def send_media(self, path, caption=""):
+            self.calls.append(("media", path, caption))
+            return object()
+
+        async def send_quiz_poll(self, question, options, correct_indexes, solution):
+            self.calls.append(("poll", question, options, correct_indexes, solution))
+            return object()
+
+        async def wait_reply(self):
+            self.calls.append(("wait",))
+            self.last_reply = self.replies.pop(0)
+            return self.last_reply
+
+        async def click(self, msg, *, text=None, index=None):
+            self.calls.append(("click", text, index))
+
+    question = load_json(Path("tests/fixtures/extended_clean_question.json"))[0]
+    client = FakeClient()
+
+    monkeypatch.setattr(flow.config, "rand_delay", lambda rng: 0)
+    asyncio.run(upload_question(client, question, index_in_quiz=1))
+
+    assert client.calls[0] == ("click", BTN_CREATE_QUESTION, None)
+    assert client.calls[1][0] == "media"
+    assert client.calls[3] == ("click", BTN_CREATE_QUESTION, None)
+    assert client.calls[4][0] == "poll"
+
+
 def test_upload_question_can_shuffle_options_and_preserve_correct_answer(monkeypatch):
     class FakeMessage:
         def __init__(self, text, buttons=None):

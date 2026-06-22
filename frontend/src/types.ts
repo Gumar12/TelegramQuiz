@@ -22,6 +22,7 @@ export interface Question {
 export interface QuizGroup {
   id: string;
   name: string; // e.g. "19 мая УТРО"
+  allow_duplicate_questions?: boolean;
   date: string;
   description: string;
   questions: Question[];
@@ -57,20 +58,13 @@ export interface GroupSummary {
   path: string;
 }
 
-export interface SourceGroupSummary {
-  id: string;
-  name: string;
-  questions_count: number;
-  generated: boolean;
-  path: string;
-}
-
 export interface ValidationReport {
   questions_total: number;
   multi_answer_count: number;
   context_count: number;
   media_count: number;
   correct_position_counts: Record<string, number>;
+  errors?: Array<Record<string, any>>;
   warnings: Array<Record<string, any>>;
 }
 
@@ -105,4 +99,144 @@ export interface JobEvent {
   warnings: string[];
   result?: Record<string, any> | null;
   error?: string;
+}
+
+export interface HealthResponse {
+  ok: boolean;
+  time?: number;
+}
+
+export interface AccountProfilePublic {
+  id: string;
+  display_name: string;
+  status: string;
+  session_path_basename: string;
+  telegram_phone_masked: string;
+  is_active: boolean;
+}
+
+export type TelegramLoginStep =
+  | 'code_sent'
+  | 'password_required'
+  | 'authorized'
+  | 'failed'
+  | 'expired'
+  | 'cancelled';
+
+export interface TelegramLoginCodeSentResponse {
+  login_id: string;
+  profile_id: string;
+  step: 'code_sent';
+  phone_masked: string;
+  expires_at: string;
+}
+
+export interface TelegramLoginPasswordRequiredResponse {
+  login_id: string;
+  step: 'password_required';
+}
+
+export interface TelegramLoginAuthorizedResponse {
+  step: 'authorized';
+  account: AccountProfilePublic;
+}
+
+export type TelegramLoginStartResponse =
+  | TelegramLoginCodeSentResponse
+  | TelegramLoginAuthorizedResponse;
+
+export type TelegramLoginStatusResponse =
+  | TelegramLoginCodeSentResponse
+  | TelegramLoginPasswordRequiredResponse
+  | TelegramLoginAuthorizedResponse;
+
+export type TelegramLoginCodeResponse =
+  | TelegramLoginPasswordRequiredResponse
+  | TelegramLoginAuthorizedResponse;
+
+export type UploadRunStatus =
+  | 'queued'
+  | 'review_required'
+  | 'running'
+  | 'paused'
+  | 'rollback'
+  | 'skipped_forward'
+  | 'failed'
+  | 'cancelled'
+  | 'cancelled_replaced'
+  | 'completed';
+
+export type SpeedProbeRunStatus =
+  | 'running'
+  | 'cooldown'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled_replaced';
+
+export type SafeRunError = Record<string, unknown> | null;
+
+export interface UploadRunStatusSnapshot {
+  kind: 'upload';
+  run_id: string;
+  status: UploadRunStatus;
+  quiz_name: string;
+  quiz_file_basename: string;
+  account_profile_id: string;
+  speed: string;
+  start_question_index: number;
+  next_question_index: number;
+  source_question_count: number;
+  uploaded_count: number;
+  skipped_count: number;
+  cooldown_count: number;
+  estimated_remaining_seconds: number;
+  has_protected_progress: boolean;
+  last_error: SafeRunError;
+  share_link: string | null;
+  auto_resume_enabled: boolean;
+  auto_resume_delay_seconds: number;
+  auto_resume_next_at: string | null;
+  auto_resume_attempts: number;
+  auto_resume_last_job_id: string | null;
+  auto_resume_last_scheduled_at: string | null;
+  updated_at: string;
+}
+
+export interface SpeedProbeRunStatusSnapshot {
+  kind: 'speed_probe';
+  probe_id: string;
+  status: SpeedProbeRunStatus;
+  quiz_name: string;
+  source_quiz_file_basename: string;
+  account_profile_id: string;
+  first_limit_at_question: number | null;
+  limit_event_count: number;
+  cleanup_status: string;
+  has_protected_progress: boolean;
+  last_error: SafeRunError;
+  updated_at: string;
+}
+
+export type RunStatusSnapshot = UploadRunStatusSnapshot | SpeedProbeRunStatusSnapshot;
+
+export type ActiveRunResponse =
+  | { active: false }
+  | (RunStatusSnapshot & { active: true });
+
+export interface SettingsResponse {
+  workspace_dir: string;
+  source_path: string;
+  media_dir: string;
+  quizzes_dir: string;
+  eta?: {
+    bot_response_seconds: number;
+    speed_profiles?: Record<string, Record<string, number>>;
+  };
+  paths: {
+    workspace: string;
+    source: string;
+    media: string;
+    quizzes: string;
+  };
 }

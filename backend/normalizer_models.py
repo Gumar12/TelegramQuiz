@@ -127,7 +127,7 @@ def _correct_indexes(correct: int | list[int], option_count: int) -> list[int]:
 
 
 def validate_clean_question(item: CleanQuestion, *, check_distractor_quality: bool = True) -> None:
-    if not (1 <= len(item.question) <= 300):
+    if not (1 <= len(item.question) <= 255):
         _raise("too_long_question", f"question length is {len(item.question)}")
 
     if len(item.options) != 4:

@@ -12,6 +12,7 @@
 """
 import asyncio
 import logging
+from pathlib import Path
 import random
 import re
 from typing import Callable, Optional
@@ -34,6 +35,7 @@ BOT_PROMPTS = {
     "ask_vote_for_correct": "проголосуйте за правильный ответ",
     "ask_next_question":    "Если Вы сделали ошибку",
     "prelude_create_question": "Нажмите на кнопку, чтобы создать новый вопрос",
+    "prelude_already_set":  "Перед вопросом может быть показано только одно сообщение",
     "ask_time_limit":       "Укажите ограничение времени",
     "ask_shuffle_mode":     "случайном порядке",
     "quiz_ready":           "Тест готов",
@@ -295,6 +297,32 @@ def _caption_for_media(context: str) -> str:
     return context[:MEDIA_CAPTION_LIMIT - 1].rstrip() + "…"
 
 
+def _resolve_media_path(media_path: str) -> str:
+    raw = str(media_path).strip()
+    if not raw:
+        return raw
+    if re.match(r"^(https?://|tg://)", raw, re.IGNORECASE):
+        return raw
+
+    path = Path(raw).expanduser()
+    candidates: list[Path] = [path]
+    if not path.is_absolute():
+        normalized = raw.replace("\\", "/").lstrip("/")
+        relative = Path(normalized)
+        candidates.extend(
+            [
+                config.PROJECT_ROOT / relative,
+                config.DATA_DIR / relative,
+                config.DATA_DIR / "media" / relative.name,
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return raw
+
+
 def _find_create_question_button(msg: Message) -> str:
     if not msg.buttons:
         raise UnexpectedBotState("prelude prompt has no create-question button")
@@ -316,9 +344,13 @@ async def _wait_after_prelude(client: QuizBotClient, step: str) -> None:
         BOT_PROMPTS["ask_first_question"],
         BOT_PROMPTS["ask_next_question"],
         BOT_PROMPTS["prelude_create_question"],
+        BOT_PROMPTS["prelude_already_set"],
         step=step,
     )
-    if _text_contains(reply, BOT_PROMPTS["prelude_create_question"]):
+    if (
+        _text_contains(reply, BOT_PROMPTS["prelude_create_question"])
+        or _text_contains(reply, BOT_PROMPTS["prelude_already_set"])
+    ):
         button_text = _find_create_question_button(reply)
         await client.click(reply, text=button_text)
 
@@ -352,8 +384,9 @@ async def _send_question_prelude(
                 index_in_quiz,
                 len(media_paths),
             )
-        log.info("Sending media before question %d: %s", index_in_quiz, media_paths[0])
-        await client.send_media(media_paths[0], caption=_caption_for_media(context))
+        media_path = _resolve_media_path(media_paths[0])
+        log.info("Sending media before question %d: %s", index_in_quiz, media_path)
+        await client.send_media(media_path, caption=_caption_for_media(context))
         await _wait_after_prelude(client, step="media_ack")
         return
 

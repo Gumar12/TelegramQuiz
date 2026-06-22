@@ -57,15 +57,26 @@ except ImportError:
 class QuizBotClient:
     """Async context manager: открывает сессию + conversation с @QuizBot."""
 
-    def __init__(self):
-        self.client = TelegramClient(
-            config.SESSION_NAME, config.API_ID, config.API_HASH
+    def __init__(
+        self,
+        *,
+        session_name: str | None = None,
+        api_id: int | None = None,
+        api_hash: str | None = None,
+        phone: str | None = None,
+    ):
+        self.session_name = (
+            session_name if session_name is not None else config.SESSION_NAME
         )
+        self.api_id = api_id if api_id is not None else config.API_ID
+        self.api_hash = api_hash if api_hash is not None else config.API_HASH
+        self.phone = phone if phone is not None else config.PHONE
+        self.client = TelegramClient(self.session_name, self.api_id, self.api_hash)
         self._conv: Optional[Conversation] = None
         self.last_reply: Optional[Message] = None
 
     async def __aenter__(self) -> "QuizBotClient":
-        await self.client.start(phone=config.PHONE)
+        await self.client.start(phone=self.phone)
         log.info("Telegram session started")
         self._conv = self.client.conversation(
             config.BOT_USERNAME,
@@ -104,11 +115,12 @@ class QuizBotClient:
     async def send_media(self, path: str, caption: str = "") -> Message:
         """Шлёт локальный медиафайл в @QuizBot как pre-question сообщение."""
         await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        if self._conv is None:
+            raise RuntimeError("QuizBot conversation is not open")
         last_exc: Optional[Exception] = None
         for attempt in range(config.MAX_RETRIES_ON_FLOOD):
             try:
-                msg = await self.client.send_file(
-                    config.BOT_USERNAME,
+                msg = await self._conv.send_file(
                     file=path,
                     caption=caption or None,
                 )
@@ -139,6 +151,8 @@ class QuizBotClient:
         Возвращает Message с отправленным poll-ом (нужен для возможного SendVote).
         """
         await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        if self._conv is None:
+            raise RuntimeError("QuizBot conversation is not open")
         normalized_correct_indexes = _normalize_correct_indexes(
             correct_indexes if correct_indexes is not None else correct_index
         )
@@ -160,17 +174,19 @@ class QuizBotClient:
         if "hash" in _POLL_PARAMS:
             poll_kwargs["hash"] = 0
         poll = Poll(**poll_kwargs)
-        media = InputMediaPoll(
-            poll=poll,
-            correct_answers=_correct_answers(normalized_correct_indexes),
-            solution=solution or "",
-            solution_entities=[],
-        )
+        media_kwargs = {
+            "poll": poll,
+            "correct_answers": _correct_answers(normalized_correct_indexes),
+        }
+        if solution:
+            media_kwargs["solution"] = solution
+            media_kwargs["solution_entities"] = []
+        media = InputMediaPoll(**media_kwargs)
 
         last_exc: Optional[Exception] = None
         for attempt in range(config.MAX_RETRIES_ON_FLOOD):
             try:
-                msg = await self.client.send_file(config.BOT_USERNAME, file=media)
+                msg = await self._conv.send_file(file=media)
                 log.info(
                     "→ [poll] %s | %d options, correct=%s, solution=%r",
                     _truncate(question, 80), len(options), normalized_correct_indexes,

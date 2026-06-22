@@ -47,8 +47,8 @@ export function validateQuestion(
   // 1. Text length checks
   if (!question || question.trim().length === 0) {
     warnings.push('Текст вопроса не может быть пустым.');
-  } else if (question.length > 300) {
-    warnings.push(`Превышен лимит Telegram для вопроса (300 симв): сейчас ${question.length} симв.`);
+  } else if (question.length > 255) {
+    warnings.push(`Превышен лимит Telegram для вопроса (255 симв): сейчас ${question.length} симв.`);
   }
 
   // 2. Options check

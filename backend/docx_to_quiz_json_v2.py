@@ -22,6 +22,8 @@ NUMBERED_RE = re.compile(r"^\s*(\d+)[\.\)]\s*(.+)$")
 ANSWER_PREFIX_RE = re.compile(r"^\s*(?:✔️|✅)?\s*(?:Ответ\s*[:：]\s*)?(.*)$", re.I)
 ANSWER_CHOICE_RE = re.compile(r"^\s*(?:Ответ|Answer)\s*[:：]\s*(.+)$", re.I)
 ANSWER_CHOICE_TOKEN_RE = re.compile(r"(?<![A-Za-zА-Яа-я])([AАBВCСDД])(?![A-Za-zА-Яа-я])", re.I)
+ROMAN_STATEMENT_RE = re.compile(r"^\s*[IVXLCDM]+\.\s+\S+", re.I)
+ROMAN_LINE_RE = re.compile(r"^\s*([IVXLCDM]+)\.\s+(.+)$", re.I)
 QUESTION_STARTS = (
     "какой",
     "какая",
@@ -36,6 +38,14 @@ QUESTION_STARTS = (
     "как ",
     "каким",
     "какую",
+)
+STATEMENT_SELECTION_PROMPTS = (
+    "выберите верные",
+    "выберите верное",
+    "установите верные",
+    "укажите верные",
+    "верные утверждения",
+    "правильные утверждения",
 )
 QUOTE_OPENERS = ("«", '"', "“")
 QUOTE_CLOSERS = ("»", '"', "”")
@@ -58,6 +68,11 @@ def closes_quote_context(line: str) -> bool:
         if closer in s[1:]:
             return True
     return False
+
+
+def quote_balance_delta(line: str) -> int:
+    s = clean(line)
+    return s.count("«") + s.count("“") - s.count("»") - s.count("”")
 
 
 def run_is_bold(run: Any) -> bool:
@@ -134,12 +149,12 @@ def iter_docx_blocks(docx_path: str | Path, media_dir: str | Path) -> list[dict[
     return blocks
 
 
-def split_inline_qa(line: str) -> tuple[str, str] | None:
+def split_inline_qa(line: str, *, allow_colon: bool = True) -> tuple[str, str] | None:
     s = clean(line)
     if len(s) < 8 or DATE_RE.match(s) or SECTION_RE.match(s) or OPTION_RE.match(s):
         return None
 
-    if ":" in s and not s.lower().startswith("контекст"):
+    if allow_colon and ":" in s and not s.lower().startswith("контекст"):
         left, right = s.split(":", 1)
         if len(left) > 8 and len(right) > 2:
             return clean(left), clean(right)
@@ -207,6 +222,8 @@ def compact_for_option(answer: str, max_len: int = 100) -> str:
         ans,
         flags=re.I,
     )
+    if ROMAN_STATEMENT_RE.match(ans):
+        return ans[: max_len - 1].rstrip() + "…" if len(ans) > max_len else ans
     first_sentence = re.split(r"[.;]", ans)[0].strip()
     if 3 <= len(first_sentence) <= max_len:
         return first_sentence
@@ -368,6 +385,41 @@ def numbered_statement_options(
     return options, index
 
 
+def roman_statement_block(
+    blocks: list[dict[str, Any]],
+    start_index: int,
+) -> tuple[list[str], int]:
+    statements: list[str] = []
+    index = start_index
+    expected_number = 1
+
+    while index < len(blocks) and blocks[index]["type"] == "text":
+        line = clean(blocks[index].get("text", ""))
+        match = ROMAN_LINE_RE.match(line)
+        if not match:
+            break
+        roman_number = ROMAN_TO_INT.get(match.group(1).upper())
+        if roman_number != expected_number:
+            break
+        statements.append(line)
+        expected_number += 1
+        index += 1
+
+    return statements, index
+
+
+def statement_context_text(statements: list[str]) -> str:
+    return "\n".join(clean(statement) for statement in statements if clean(statement))
+
+
+def next_text_is_option_group(blocks: list[dict[str, Any]], index: int) -> bool:
+    return (
+        index + 1 < len(blocks)
+        and blocks[index + 1]["type"] == "text"
+        and bool(split_option_line(clean(blocks[index + 1].get("text", ""))))
+    )
+
+
 def _add_unique(candidates: list[str], option: str, correct_key: str) -> None:
     option = clean(option)
     if not option or len(option) > 100:
@@ -412,6 +464,9 @@ def contextual_distractors(item: dict[str, Any]) -> list[str]:
     if _year_distractors(answer):
         return _year_distractors(answer)[:3]
 
+    if any(prompt in question for prompt in STATEMENT_SELECTION_PROMPTS):
+        return []
+
     keyword_rules = [
         (("съезд", "осудив"), ["XIX съезд", "XXI съезд", "XVIII съезд"]),
         (("административных реформ", "традиционного общества"), ["ликвидация ханской власти", "введение окружного управления", "переселение русских крестьян"]),
@@ -444,16 +499,6 @@ def contextual_distractors(item: dict[str, Any]) -> list[str]:
             for option in options:
                 _add_unique(candidates, option, answer_key)
             return candidates[:3]
-
-    if "выберите верные" in question:
-        for option in [
-            "был чингизидом",
-            "принял ханский титул",
-            "происходил из рода Джучи",
-            "создал государство в Дешт-и-Кыпчаке",
-        ]:
-            _add_unique(candidates, option, answer_key)
-        return candidates[:3]
 
     if "чингизид" in combined or "так как" in question:
         for option in [
@@ -528,28 +573,35 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     current_context_text: list[str] = []
     current_context_media: list[str] = []
     quote_context_open = False
+    quote_context_depth = 0
     collecting_context = False
 
     pending_question: str | None = None
     pending_options: list[str] = []
     pending_correct_options: list[int] = []
     pending_correct_source = "source_document_bold"
+    pending_context_text: list[str] = []
     pending_media: list[str] = []
 
     def reset_context() -> None:
         nonlocal current_context_title, current_context_text, current_context_media
-        nonlocal quote_context_open, collecting_context
+        nonlocal quote_context_open, quote_context_depth, collecting_context
         current_context_title = ""
         current_context_text = []
         current_context_media = []
         quote_context_open = False
+        quote_context_depth = 0
         collecting_context = False
 
     def context_text() -> str:
         return clean("\n".join(current_context_text))
 
+    def pending_context() -> str:
+        parts = [part for part in [context_text(), statement_context_text(pending_context_text)] if part]
+        return "\n".join(parts)
+
     def flush_pending() -> None:
-        nonlocal pending_question, pending_options, pending_correct_options, pending_correct_source, pending_media
+        nonlocal pending_question, pending_options, pending_correct_options, pending_correct_source, pending_context_text, pending_media
         if not pending_question:
             return
 
@@ -585,7 +637,7 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "date": current_date,
             "section": current_section,
             "context_title": current_context_title,
-            "context": context_text(),
+            "context": pending_context(),
             "media": list(current_context_media + pending_media),
             "question": pending_question,
             "correct_answer": correct_answer,
@@ -604,6 +656,7 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         pending_options = []
         pending_correct_options = []
         pending_correct_source = "source_document_bold"
+        pending_context_text = []
         pending_media = []
 
     i = 0
@@ -671,12 +724,13 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             i += 1
             continue
 
-        if starts_quote_context(line):
+        if starts_quote_context(line) and not next_text_is_option_group(blocks, i):
             flush_pending()
             current_context_title = "Контекст"
             current_context_text = []
             current_context_media = []
-            quote_context_open = not closes_quote_context(line)
+            quote_context_depth = max(0, quote_balance_delta(line))
+            quote_context_open = quote_context_depth > 0 or not closes_quote_context(line)
             current_context_title = current_context_title or "Контекст"
             current_context_text.append(line)
             i += 1
@@ -685,7 +739,7 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if quote_context_open:
             current_context_title = current_context_title or "Контекст"
             current_context_text.append(line)
-            inline = split_inline_qa(line)
+            inline = split_inline_qa(line, allow_colon=False)
             if inline:
                 question, answer = inline
                 media = list(current_context_media + pending_media)
@@ -709,7 +763,10 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     }
                 )
                 pending_media = []
-            if closes_quote_context(line):
+            if quote_context_depth > 0:
+                quote_context_depth = max(0, quote_context_depth + quote_balance_delta(line))
+                quote_context_open = quote_context_depth > 0
+            elif closes_quote_context(line):
                 quote_context_open = False
             i += 1
             continue
@@ -737,22 +794,50 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if numbered_match:
             line = clean(numbered_match.group(2))
 
-        next_is_option_group = (
-            i + 1 < len(blocks)
-            and blocks[i + 1]["type"] == "text"
-            and bool(split_option_line(clean(blocks[i + 1].get("text", ""))))
-        )
-        if next_is_option_group and not split_option_line(line):
+        roman_statements, option_start = roman_statement_block(blocks, i + 1)
+        if (
+            roman_statements
+            and option_start < len(blocks)
+            and blocks[option_start]["type"] == "text"
+            and split_option_line(clean(blocks[option_start].get("text", "")))
+        ):
             flush_pending()
             collecting_context = False
             pending_question = clean(line.rstrip(":"))
             pending_options = []
             pending_correct_options = []
             pending_correct_source = "source_document_bold"
+            pending_context_text = roman_statements
+            pending_media = []
+            i = option_start
+            continue
+
+        next_is_option_group = next_text_is_option_group(blocks, i)
+        if next_is_option_group and not split_option_line(line) and not ROMAN_STATEMENT_RE.match(line):
+            flush_pending()
+            collecting_context = False
+            pending_question = clean(line.rstrip(":"))
+            pending_options = []
+            pending_correct_options = []
+            pending_correct_source = "source_document_bold"
+            pending_context_text = []
             i += 1
             continue
 
-        inline = split_inline_qa(line)
+        inline_candidate = split_inline_qa(line)
+        if (
+            collecting_context
+            and current_context_title
+            and not pending_question
+            and not is_question_line(line)
+            and not is_answer_prompt_line(line)
+            and (inline_candidate is None or len(line) > 300)
+        ):
+            current_context_text.append(line)
+            i += 1
+            continue
+
+        inline = inline_candidate
         if inline:
             flush_pending()
             question, answer = inline
@@ -830,6 +915,7 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     pending_options = []
                     pending_correct_options = []
                     pending_correct_source = "source_document_bold"
+                    pending_context_text = []
                     i = j
                     continue
                 if (
@@ -870,6 +956,7 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             pending_options = []
             pending_correct_options = []
             pending_correct_source = "source_document_bold"
+            pending_context_text = []
             pending_media = []
 
             j = i + 1
@@ -914,12 +1001,6 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             i += 1
             continue
 
-        # Only accumulate context text while still collecting a block's context
-        # (right after a heading/«контекст»), before its questions begin. This
-        # prevents stray option/statement fragments from polluting the context.
-        if collecting_context and current_context_title and not pending_question:
-            current_context_text.append(line)
-
         i += 1
 
     flush_pending()
@@ -951,7 +1032,7 @@ def build_output(
         "quiz_description": description,
         "format_version": "2.0",
         "telegram_limits": {
-            "poll_question_max_chars": 300,
+            "poll_question_max_chars": 255,
             "option_max_chars": 100,
             "explanation_max_chars": 200,
             "note": "Long context/images should be sent before the poll or stored in explanation_full.",

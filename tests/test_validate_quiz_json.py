@@ -78,6 +78,37 @@ def test_validate_file_returns_zero_for_schema_valid_file(tmp_path: Path):
     assert validate_quiz_json.validate_file(path, strict=False) == 0
 
 
+def test_validate_file_allows_duplicate_questions_when_quiz_flag_enabled(tmp_path: Path):
+    question = {
+        "question": "Одинаковый текст?",
+        "options": ["Первый", "Второй", "Третий", "Четвертый"],
+        "correct": 1,
+        "context": "Достаточно длинный контекст для проверки.",
+    }
+    payload = {
+        "allow_duplicate_questions": True,
+        "questions": [dict(question), dict(question)],
+    }
+    path = tmp_path / "quiz.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert validate_quiz_json.validate_file(path, strict=False) == 0
+
+
+def test_validate_file_blocks_duplicate_questions_without_quiz_flag(tmp_path: Path):
+    question = {
+        "question": "Одинаковый текст?",
+        "options": ["Первый", "Второй", "Третий", "Четвертый"],
+        "correct": 1,
+        "context": "Достаточно длинный контекст для проверки.",
+    }
+    payload = {"questions": [dict(question), dict(question)]}
+    path = tmp_path / "quiz.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert validate_quiz_json.validate_file(path, strict=False) == 1
+
+
 def test_configure_stdout_reconfigures_to_utf8(monkeypatch):
     calls = []
 

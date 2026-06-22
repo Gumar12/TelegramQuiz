@@ -47,6 +47,7 @@ python -m backend.main --file quiz.json --name "Название"
 - Do not rewrite unrelated code or generated data.
 - Treat `backend/.env`, `*.session`, API keys, media, DOCX, and real quiz data as private.
 - Avoid changing upload pacing, Telegram behavior, or production-like settings unless asked.
+- When adding or changing backend endpoints, ask whether matching frontend API client methods should be created in `frontend/src/api.ts` for later web-platform integration.
 - Prefer scoped tests for code changes; docs-only changes do not require project tests.
 
 ## Before Final Answer

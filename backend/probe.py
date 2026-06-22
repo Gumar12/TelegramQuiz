@@ -1,7 +1,7 @@
 """Probe-скрипт: подключается к Telegram через Telethon и логирует ВСЕ
 входящие сообщения от @QuizBot вместе с подписями inline-кнопок.
 
-Запуск:
+Legacy-запуск без веб-платформы:
     1. Скопировать backend/.env.example → backend/.env, заполнить API_ID/API_HASH/PHONE
     2. python -m backend.probe
     3. При первом запуске ввести код подтверждения из Telegram
