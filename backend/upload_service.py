@@ -321,8 +321,10 @@ class UploadService:
     ) -> runs.UploadRun:
         run = self._load_upload_run(run_id)
         questions_by_source = _questions_by_source(payload.legacy_quiz)
-        speed_snapshot = _capture_speed_settings()
-        _apply_upload_speed_preset(run.speed, uploaded_questions=len(run.uploaded_questions))
+        timing_profile = _build_upload_timing_profile(
+            run.speed,
+            uploaded_questions=len(run.uploaded_questions),
+        )
         run.status = "running"
         run.last_error = None
         if run.started_at is None:
@@ -330,79 +332,82 @@ class UploadService:
         run = self.run_store.save_run(run)
 
         try:
-            client_cm = await _maybe_await(self.client_factory(run.account_profile_id))
-            async with client_cm as client:
-                run = self._load_upload_run(run_id)
-                if not _draft_created(run):
-                    await self.flow.create_quiz(client, run.quiz_name)
+            async with telegram_client_factory.session_lock_for_profile(
+                run.account_profile_id,
+                store_root=self.account_store_root,
+                config_module=config,
+            ):
+                client_cm = await _maybe_await(self.client_factory(run.account_profile_id))
+                setattr(client_cm, "timing_profile", timing_profile)
+                async with client_cm as client:
                     run = self._load_upload_run(run_id)
-                    run.last_bot_state = {
-                        **(run.last_bot_state or {}),
-                        "draft_created": True,
-                    }
-                    run = self.run_store.save_run(run)
-
-                last_context_key: tuple[str, str, tuple[str, ...]] | None = None
-                while run.next_question_index <= run.source_question_count:
-                    run = self._load_upload_run(run_id)
-                    if run.status in {"paused", "cancelled"}:
-                        return run
-                    source_index = run.next_question_index
-                    if source_index in run.skipped_questions:
-                        run.next_question_index = source_index + 1
+                    if not _draft_created(run):
+                        await self.flow.create_quiz(client, run.quiz_name)
+                        run = self._load_upload_run(run_id)
+                        run.last_bot_state = {
+                            **(run.last_bot_state or {}),
+                            "draft_created": True,
+                        }
                         run = self.run_store.save_run(run)
-                        self._notify_checkpoint(run)
-                        continue
-                    if source_index in set(payload.gate.skipped_question_indexes):
-                        run = self.run_store.record_skip(
+
+                    last_context_key: tuple[str, str, tuple[str, ...]] | None = None
+                    while run.next_question_index <= run.source_question_count:
+                        run = self._load_upload_run(run_id)
+                        if run.status in {"paused", "cancelled"}:
+                            return run
+                        source_index = run.next_question_index
+                        if source_index in run.skipped_questions:
+                            run.next_question_index = source_index + 1
+                            run = self.run_store.save_run(run)
+                            self._notify_checkpoint(run)
+                            continue
+                        if source_index in set(payload.gate.skipped_question_indexes):
+                            run = self.run_store.record_skip(
+                                run_id,
+                                source_index,
+                                reason="review_decision",
+                                skipped_by="review",
+                            )
+                            self._notify_checkpoint(run)
+                            continue
+
+                        question = questions_by_source.get(source_index)
+                        if question is None:
+                            raise UploadServiceError(
+                                f"No upload question for source index {source_index}"
+                            )
+                        run = await self._auto_cooldown_if_due(run_id, run)
+                        active_speed_preset = timing_profile.speed_mode
+                        send_prelude, last_context_key = _prelude_decision(
+                            question,
+                            context_send_mode=run.context_send_mode,
+                            last_context_key=last_context_key,
+                        )
+                        draft_question_index = len(run.uploaded_questions) + 1
+                        await self.flow.upload_question(
+                            client,
+                            question,
+                            index_in_quiz=draft_question_index,
+                            send_prelude=send_prelude,
+                            shuffle_options=run.shuffle_options,
+                        )
+                        run = self.run_store.record_question_uploaded(
                             run_id,
                             source_index,
-                            reason="review_decision",
-                            skipped_by="review",
+                            last_bot_state={
+                                "source_question_index": source_index,
+                                "draft_question_index": draft_question_index,
+                                "speed": run.speed,
+                                "active_speed_preset": active_speed_preset,
+                            },
                         )
                         self._notify_checkpoint(run)
-                        continue
 
-                    question = questions_by_source.get(source_index)
-                    if question is None:
-                        raise UploadServiceError(
-                            f"No upload question for source index {source_index}"
-                        )
-                    run = await self._auto_cooldown_if_due(run_id, run)
-                    active_speed_preset = _apply_upload_speed_preset(
-                        run.speed,
-                        uploaded_questions=len(run.uploaded_questions),
-                    )
-                    send_prelude, last_context_key = _prelude_decision(
-                        question,
-                        context_send_mode=run.context_send_mode,
-                        last_context_key=last_context_key,
-                    )
-                    draft_question_index = len(run.uploaded_questions) + 1
-                    await self.flow.upload_question(
-                        client,
-                        question,
-                        index_in_quiz=draft_question_index,
-                        send_prelude=send_prelude,
-                        shuffle_options=run.shuffle_options,
-                    )
-                    run = self.run_store.record_question_uploaded(
-                        run_id,
-                        source_index,
-                        last_bot_state={
-                            "source_question_index": source_index,
-                            "draft_question_index": draft_question_index,
-                            "speed": run.speed,
-                            "active_speed_preset": active_speed_preset,
-                        },
-                    )
-                    self._notify_checkpoint(run)
-
-                share_link = await self.flow.finish_quiz(client)
-                run = self._load_upload_run(run_id)
-                run.status = "completed"
-                run.share_link = share_link
-                return self.run_store.save_run(run)
+                    share_link = await self.flow.finish_quiz(client)
+                    run = self._load_upload_run(run_id)
+                    run.status = "completed"
+                    run.share_link = share_link
+                    return self.run_store.save_run(run)
         except KeyboardInterrupt as exc:
             return self._pause_for_user(run_id, exc)
         except asyncio.CancelledError as exc:
@@ -415,8 +420,6 @@ class UploadService:
             if _is_recoverable_runtime_error(exc):
                 return self._pause_or_fail(run_id, exc)
             raise
-        finally:
-            _restore_speed_settings(speed_snapshot)
 
     async def _rollback_uploaded_questions(
         self,
@@ -426,23 +429,28 @@ class UploadService:
         run = self._load_upload_run(run_id)
         run.status = "rollback"
         run = self.run_store.save_run(run)
-        client_cm = await _maybe_await(self.client_factory(run.account_profile_id))
-        async with client_cm as client:
-            for position, source_index in enumerate(source_indexes_desc, start=1):
-                await self._send_undo(client)
-                run = self._load_upload_run(run_id)
-                run.uploaded_questions = [
-                    index for index in run.uploaded_questions if index != source_index
-                ]
-                run.next_question_index = min(run.next_question_index, source_index)
-                run.status = "rollback"
-                run.last_bot_state = {
-                    "undo_source_question_index": source_index,
-                    "undo_count_done": position,
-                    "undo_count_total": len(source_indexes_desc),
-                }
-                run = self.run_store.save_run(run)
-                self._notify_checkpoint(run)
+        async with telegram_client_factory.session_lock_for_profile(
+            run.account_profile_id,
+            store_root=self.account_store_root,
+            config_module=config,
+        ):
+            client_cm = await _maybe_await(self.client_factory(run.account_profile_id))
+            async with client_cm as client:
+                for position, source_index in enumerate(source_indexes_desc, start=1):
+                    await self._send_undo(client)
+                    run = self._load_upload_run(run_id)
+                    run.uploaded_questions = [
+                        index for index in run.uploaded_questions if index != source_index
+                    ]
+                    run.next_question_index = min(run.next_question_index, source_index)
+                    run.status = "rollback"
+                    run.last_bot_state = {
+                        "undo_source_question_index": source_index,
+                        "undo_count_done": position,
+                        "undo_count_total": len(source_indexes_desc),
+                    }
+                    run = self.run_store.save_run(run)
+                    self._notify_checkpoint(run)
         return self._load_upload_run(run_id)
 
     async def _send_undo(self, client: Any) -> None:
@@ -576,7 +584,21 @@ class UploadService:
         exc: BaseException,
     ) -> runs.UploadRun:
         status, error = _classified_error(exc)
-        return self.run_store.update_status(run_id, status, last_error=error)
+        run = self.run_store.update_status(run_id, status, last_error=error)
+        retry_after = error.get("retry_after_seconds")
+        if status == "paused" and isinstance(retry_after, int):
+            run.cooldown_events.append(
+                {
+                    "reason": "telegram_flood_wait_cap",
+                    "code": error.get("code"),
+                    "retry_after_seconds": retry_after,
+                    "source_question_index": run.next_question_index,
+                    "recorded_at": _utc_now(),
+                }
+            )
+            run = self.run_store.save_run(run)
+            self._notify_checkpoint(run)
+        return run
 
     def _notify_checkpoint(self, run: runs.UploadRun) -> None:
         if self.checkpoint_callback is not None:
@@ -685,14 +707,13 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _apply_upload_speed_preset(speed: str, *, uploaded_questions: int) -> str:
-    preset = (
-        config.auto_speed_preset(uploaded_questions)
-        if speed == "auto"
-        else speed
-    )
-    config.apply_speed_mode(preset)
-    return preset
+def _build_upload_timing_profile(speed: str, *, uploaded_questions: int) -> config.TimingProfile:
+    preset = _resolve_upload_speed_preset(speed, uploaded_questions=uploaded_questions)
+    return config.build_timing_profile(preset)
+
+
+def _resolve_upload_speed_preset(speed: str, *, uploaded_questions: int) -> str:
+    return config.auto_speed_preset(uploaded_questions) if speed == "auto" else speed
 
 
 def _due_auto_cooldown_threshold(run: runs.UploadRun) -> int | None:
@@ -780,16 +801,3 @@ def _classified_error(exc: BaseException) -> tuple[str, dict[str, Any]]:
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-
-def _capture_speed_settings() -> dict[str, Any]:
-    return {
-        "DELAY_BETWEEN_MESSAGES": config.DELAY_BETWEEN_MESSAGES,
-        "DELAY_BETWEEN_QUESTIONS": config.DELAY_BETWEEN_QUESTIONS,
-        "LONG_PAUSE_EVERY_N_QUESTIONS": config.LONG_PAUSE_EVERY_N_QUESTIONS,
-        "LONG_PAUSE_DURATION": config.LONG_PAUSE_DURATION,
-    }
-
-
-def _restore_speed_settings(snapshot: Mapping[str, Any]) -> None:
-    for name, value in snapshot.items():
-        setattr(config, name, value)

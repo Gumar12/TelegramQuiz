@@ -199,12 +199,14 @@ def test_cors_untrusted_origin_gets_no_allow_origin():
 
 def test_cors_allows_json_post_from_vite_origin(tmp_path: Path):
     origin = "http://127.0.0.1:3000"
-    client = TestClient(studio_api.create_app())
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = tmp_path / "server-data"
+    client = TestClient(app)
 
     response = client.post(
         "/api/groups/manual",
         headers={"Origin": origin},
-        json={"title": "CORS quiz", "workspace_dir": str(tmp_path)},
+        json={"title": "CORS quiz", "workspace_dir": "cors-workspace"},
     )
 
     assert response.status_code == 200
@@ -241,6 +243,82 @@ def test_cors_allows_sse_from_vite_origin():
     assert response.headers["access-control-allow-origin"] == origin
     assert "text/event-stream" in response.headers["content-type"]
     assert b"data:" in response.content
+
+
+class _FakeRequest:
+    """Minimal stand-in for Starlette's Request driving is_disconnected()."""
+
+    def __init__(self, disconnect_after: int = 0):
+        self._calls = 0
+        self._disconnect_after = disconnect_after
+
+    async def is_disconnected(self) -> bool:
+        self._calls += 1
+        return self._calls > self._disconnect_after
+
+
+def _job_events_endpoint(app):
+    for route in app.router.routes:
+        if getattr(route, "path", None) == "/api/jobs/{job_id}/events":
+            return route.endpoint
+    raise AssertionError("job events route not found")
+
+
+def _drain_event_stream(response) -> list[str]:
+    async def collect():
+        chunks: list[str] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return chunks
+
+    return asyncio.run(collect())
+
+
+def test_sse_stream_stops_on_client_disconnect_without_cancelling_job():
+    manager = studio_api.JobManager()
+    job = manager.create_job("disconnect-sse")
+    # Running (non-terminal) job: the loop would spin forever without the
+    # disconnect break.
+    app = studio_api.create_app(manager=manager)
+    endpoint = _job_events_endpoint(app)
+
+    # Disconnect reported on the very first poll -> stream must close at once.
+    request = _FakeRequest(disconnect_after=0)
+    response = asyncio.run(endpoint(job.id, request))
+    chunks = _drain_event_stream(response)
+
+    # Stream ended (did not hang) and the job was NOT cancelled.
+    snapshot = manager.snapshot(job.id)
+    assert snapshot["status"] == "running"
+    assert snapshot["cancel_requested"] is False
+    # The pre-existing "Job created" event is delivered before disconnect-poll
+    # is checked again, but the key invariant is that the stream terminated.
+    assert isinstance(chunks, list)
+
+
+def test_sse_stream_closes_on_max_age_timeout_without_cancelling_job(monkeypatch):
+    manager = studio_api.JobManager()
+    job = manager.create_job("timeout-sse")  # running, never terminal
+    app = studio_api.create_app(manager=manager)
+    endpoint = _job_events_endpoint(app)
+
+    # Tiny max-age so the bounded timeout trips quickly; never disconnect.
+    monkeypatch.setattr(studio_api, "JOB_EVENTS_STREAM_MAX_AGE_SECONDS", 0)
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(studio_api.asyncio, "sleep", _no_sleep)
+
+    request = _FakeRequest(disconnect_after=10_000)
+    response = asyncio.run(endpoint(job.id, request))
+    chunks = _drain_event_stream(response)
+
+    # Stream closed via timeout, not by cancelling the job.
+    snapshot = manager.snapshot(job.id)
+    assert snapshot["status"] == "running"
+    assert snapshot["cancel_requested"] is False
+    assert isinstance(chunks, list)
 
 
 @pytest.mark.parametrize("raw", ["*", "http://*.localhost:3000"])
@@ -283,13 +361,16 @@ def test_groups_endpoint_lists_storage_groups(tmp_path: Path):
 
 
 def test_create_manual_group_writes_empty_draft_to_workspace(tmp_path: Path):
-    client = TestClient(studio_api.create_app())
+    workspace_root = tmp_path / "server-data"
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = workspace_root
+    client = TestClient(app)
 
     response = client.post(
         "/api/groups/manual",
         json={
             "title": "Ручной квиз",
-            "workspace_dir": str(tmp_path),
+            "workspace_dir": "manual-workspace",
         },
     )
 
@@ -298,10 +379,267 @@ def test_create_manual_group_writes_empty_draft_to_workspace(tmp_path: Path):
     assert group["name"] == "Ручной квиз"
     assert group["status"] == "draft"
     assert group["questions"] == []
-    saved_path = tmp_path / "quizzes" / f"{group['id']}.json"
+    saved_path = workspace_root / "manual-workspace" / "quizzes" / f"{group['id']}.json"
     assert saved_path.exists()
     settings = client.get("/api/settings").json()
-    assert settings["quizzes_dir"] == str(tmp_path / "quizzes")
+    assert settings["quizzes_dir"] == str(studio_api.DEFAULT_OUTPUT_DIR)
+
+
+def test_mutating_workspace_requests_are_request_local(tmp_path: Path):
+    default_source = tmp_path / "default" / "questions_v2.json"
+    default_media = tmp_path / "default" / "media"
+    default_quizzes = tmp_path / "default" / "quizzes"
+    app = studio_api.create_app(
+        source_path=default_source,
+        media_dir=default_media,
+        quizzes_dir=default_quizzes,
+        runtime_dir=tmp_path / "runtime",
+    )
+    client = TestClient(app)
+    workspace_root = tmp_path / "workspaces"
+    app.state.workspace_dir = workspace_root
+    initial_state = (
+        app.state.workspace_dir,
+        app.state.source_path,
+        app.state.media_dir,
+        app.state.quizzes_dir,
+    )
+    workspace_a = "workspace-a"
+    workspace_b = "workspace-b"
+
+    manual_response = client.post(
+        "/api/groups/manual",
+        json={"title": "Workspace A", "workspace_dir": workspace_a},
+    )
+    import_response = client.post(
+        "/api/groups/import-json",
+        data={
+            "title": "Workspace B",
+            "description": "Imported into B",
+            "workspace_dir": workspace_b,
+        },
+        files={
+            "file": (
+                "quiz.json",
+                json.dumps(
+                    {
+                        "quiz_title": "Imported",
+                        "questions": [
+                            {
+                                "question": "Who?",
+                                "options": ["A", "B"],
+                                "correct": 1,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                "application/json",
+            )
+        },
+    )
+
+    assert manual_response.status_code == 200
+    assert import_response.status_code == 200
+    manual_group = manual_response.json()["group"]
+    imported_group = import_response.json()["group"]
+    assert (workspace_root / workspace_a / "quizzes" / f"{manual_group['id']}.json").exists()
+    assert (workspace_root / workspace_b / "quizzes" / f"{imported_group['id']}.json").exists()
+    assert (
+        app.state.workspace_dir,
+        app.state.source_path,
+        app.state.media_dir,
+        app.state.quizzes_dir,
+    ) == initial_state
+    settings = client.get("/api/settings").json()
+    assert settings["source_path"] == str(default_source)
+    assert settings["media_dir"] == str(default_media)
+    assert settings["quizzes_dir"] == str(default_quizzes)
+    assert client.get("/api/groups").json()["groups"] == []
+
+
+def test_workspace_policy_rejects_absolute_outside_path(tmp_path: Path):
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = tmp_path / "server-data"
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/groups/manual",
+        json={"title": "Outside", "workspace_dir": str(tmp_path / "outside")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "workspace_dir must be a relative path inside the server data directory"
+    assert not (tmp_path / "outside" / "quizzes").exists()
+
+
+def test_workspace_policy_rejects_parent_escape(tmp_path: Path):
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = tmp_path / "server-data"
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/groups/manual",
+        json={"title": "Escape", "workspace_dir": "../escape"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "workspace_dir must be a relative path inside the server data directory"
+    assert not (tmp_path / "escape" / "quizzes").exists()
+
+
+def test_workspace_policy_allows_nested_relative_path(tmp_path: Path):
+    workspace_root = tmp_path / "server-data"
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = workspace_root
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/groups/manual",
+        json={"title": "Nested", "workspace_dir": "courses/history/week-1"},
+    )
+
+    assert response.status_code == 200
+    group_id = response.json()["group"]["id"]
+    assert (workspace_root / "courses" / "history" / "week-1" / "quizzes" / f"{group_id}.json").exists()
+
+
+def test_workspace_policy_rejects_symlink_escape(tmp_path: Path):
+    workspace_root = tmp_path / "server-data"
+    outside = tmp_path / "outside"
+    workspace_root.mkdir()
+    outside.mkdir()
+    link = workspace_root / "linked-outside"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available: {exc}")
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = workspace_root
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/groups/manual",
+        json={"title": "Symlink escape", "workspace_dir": "linked-outside/nested"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "workspace_dir must be a relative path inside the server data directory"
+    assert not (outside / "nested" / "quizzes").exists()
+
+
+def test_omitted_workspace_requests_use_app_defaults_and_preserve_state(tmp_path: Path, monkeypatch):
+    default_workspace = tmp_path / "default"
+    default_source = default_workspace / "questions_v2.json"
+    default_media = default_workspace / "media"
+    default_quizzes = default_workspace / "quizzes"
+    app = studio_api.create_app(
+        source_path=default_source,
+        media_dir=default_media,
+        quizzes_dir=default_quizzes,
+        runtime_dir=tmp_path / "runtime",
+    )
+    app.state.workspace_dir = default_workspace
+    client = TestClient(app)
+    initial_state = (
+        app.state.workspace_dir,
+        app.state.source_path,
+        app.state.media_dir,
+        app.state.quizzes_dir,
+    )
+
+    def fake_build_output(docx_path, output_path, media_dir, title, description):
+        data = {
+            "quiz_title": title,
+            "quiz_description": description,
+            "format_version": "2.0",
+            "report": {"items_total": 1},
+            "questions": [
+                {
+                    "id": 1,
+                    "question": "Docx question?",
+                    "options": ["A", "B", "C"],
+                    "correct": 1,
+                    "type": "single",
+                    "source": "docx_v2",
+                }
+            ],
+        }
+        Path(output_path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return data
+
+    monkeypatch.setattr(studio_api, "build_output", fake_build_output)
+
+    manual_response = client.post(
+        "/api/groups/manual",
+        json={"title": "Default manual omitted"},
+    )
+    empty_manual_response = client.post(
+        "/api/groups/manual",
+        json={"title": "Default manual empty", "workspace_dir": ""},
+    )
+    import_response = client.post(
+        "/api/groups/import-json",
+        data={
+            "title": "Default import omitted",
+            "description": "Imported into app default",
+        },
+        files={
+            "file": (
+                "quiz.json",
+                json.dumps(
+                    {
+                        "quiz_title": "Imported",
+                        "questions": [
+                            {
+                                "question": "Who?",
+                                "options": ["A", "B"],
+                                "correct": 1,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                "application/json",
+            )
+        },
+    )
+    docx_response = client.post(
+        "/api/jobs/create-from-docx",
+        data={
+            "title": "Default DOCX omitted",
+            "description": "Local parser",
+        },
+        files={
+            "file": (
+                "sample.docx",
+                b"not a real docx because build_output is patched",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert manual_response.status_code == 200
+    assert empty_manual_response.status_code == 200
+    assert import_response.status_code == 200
+    assert docx_response.status_code == 200
+    docx_snapshot = _wait_for_job(client, docx_response.json()["job_id"])
+    assert docx_snapshot["status"] == "completed"
+
+    manual_group = manual_response.json()["group"]
+    empty_manual_group = empty_manual_response.json()["group"]
+    imported_group = import_response.json()["group"]
+    docx_group = docx_snapshot["result"]["groups"][0]
+    assert (default_quizzes / f"{manual_group['id']}.json").exists()
+    assert (default_quizzes / f"{empty_manual_group['id']}.json").exists()
+    assert (default_quizzes / f"{imported_group['id']}.json").exists()
+    assert Path(docx_group["output"]).parent == default_quizzes
+    assert (
+        app.state.workspace_dir,
+        app.state.source_path,
+        app.state.media_dir,
+        app.state.quizzes_dir,
+    ) == initial_state
 
 
 def test_archive_group_endpoint_moves_quiz_out_of_active_groups(tmp_path: Path):
@@ -974,6 +1312,60 @@ def test_upload_endpoint_rejects_protected_active_run_without_confirmation(tmp_p
     assert "+77001234567" not in payload_text
 
 
+def test_put_group_with_invalid_group_id_returns_400(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    quizzes_dir.mkdir(parents=True, exist_ok=True)
+    client = TestClient(studio_api.create_app(quizzes_dir=quizzes_dir, runtime_dir=tmp_path / "runtime"))
+
+    # A group id with a character outside the safe set reaches the handler and
+    # must be rejected with HTTP 400 before any path is built.
+    response = client.put(
+        "/api/groups/" + quote("bad*id", safe=""),
+        json={"id": "bad*id", "name": "x", "questions": []},
+    )
+
+    assert response.status_code == 400
+    # Nothing was written for the rejected id.
+    assert list(quizzes_dir.iterdir()) == []
+
+
+def test_put_group_with_bad_payload_returns_400(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    _write_legacy_group(quizzes_dir)
+    client = TestClient(studio_api.create_app(quizzes_dir=quizzes_dir, runtime_dir=tmp_path / "runtime"))
+
+    # questions must be a list; save_group raises ValueError -> HTTP 400.
+    response = client.put("/api/groups/sample", json={"id": "sample", "questions": "nope"})
+
+    assert response.status_code == 400
+
+
+def test_upload_endpoint_blocks_when_active_run_state_is_corrupt(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    runtime_dir = tmp_path / "runtime"
+    _write_legacy_group(quizzes_dir)
+    quiz_path = _clean_quiz_file(tmp_path)
+    store = runs.RunStore(runtime_dir)
+    store.create_upload_run(
+        run_id="active-run",
+        quiz_file=quiz_path,
+        quiz_name="Active",
+        account_profile_id="default",
+        source_question_count=1,
+    )
+    # Corrupt the active run state file: it must BLOCK, not be treated as
+    # "no active run" (which would bypass the protected-run gate).
+    state_path = store.state_path("active-run")
+    state_path.write_text("{ this is not valid json", encoding="utf-8")
+
+    client = TestClient(studio_api.create_app(quizzes_dir=quizzes_dir, runtime_dir=runtime_dir))
+    response = client.post("/api/jobs/upload", json={"group_id": "sample"})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "active_run_unreadable"
+
+
 def test_upload_endpoint_confirmed_replace_reaches_service_with_replace_active(tmp_path: Path, monkeypatch):
     quizzes_dir = tmp_path / "quizzes"
     runtime_dir = tmp_path / "runtime"
@@ -1054,14 +1446,17 @@ def test_create_from_docx_exports_editor_json_without_openai(tmp_path: Path, mon
         return data
 
     monkeypatch.setattr(studio_api, "build_output", fake_build_output)
-    client = TestClient(studio_api.create_app())
+    workspace_root = tmp_path / "server-data"
+    app = studio_api.create_app(runtime_dir=tmp_path / "runtime")
+    app.state.workspace_dir = workspace_root
+    client = TestClient(app)
 
     response = client.post(
         "/api/jobs/create-from-docx",
         data={
             "title": "Custom quiz",
             "description": "Local parser",
-            "workspace_dir": str(tmp_path),
+            "workspace_dir": "docx-workspace",
         },
         files={
             "file": (
@@ -1083,18 +1478,15 @@ def test_create_from_docx_exports_editor_json_without_openai(tmp_path: Path, mon
     assert snapshot["status"] == "completed"
     created = snapshot["result"]["groups"][0]
     output_path = Path(created["output"])
-    assert output_path.parent == tmp_path / "quizzes"
+    assert output_path.parent == workspace_root / "docx-workspace" / "quizzes"
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["format_version"] == "2.0-direct"
     assert payload["quiz_title"] == "Custom quiz"
     assert payload["questions"][0]["correct"] == 2
     assert "Парсер не нашёл правильный ответ." in payload["questions"][1]["quality_flags"]
-
-    group_response = client.get(f"/api/groups/{created['id']}")
-    assert group_response.status_code == 200
-    group = group_response.json()
-    assert group["status"] == "review"
-    assert group["questions"][1]["correct"] == -1
+    settings = client.get("/api/settings").json()
+    assert settings["quizzes_dir"] == str(studio_api.DEFAULT_OUTPUT_DIR)
+    assert client.get(f"/api/groups/{created['id']}").status_code == 404
 
 
 def test_media_endpoint_resolves_current_media_dir(tmp_path: Path):

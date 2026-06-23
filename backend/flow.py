@@ -77,6 +77,27 @@ def _text_contains(msg: Message, needle: str) -> bool:
     return needle.lower() in (msg.text or "").lower()
 
 
+def _delay_between_questions(client: QuizBotClient) -> tuple[float, float]:
+    profile = getattr(client, "timing_profile", None)
+    if profile is not None:
+        return profile.delay_between_questions
+    return config.DELAY_BETWEEN_QUESTIONS
+
+
+def _long_pause_every_n_questions(client: QuizBotClient) -> int:
+    profile = getattr(client, "timing_profile", None)
+    if profile is not None:
+        return profile.long_pause_every_n_questions
+    return config.LONG_PAUSE_EVERY_N_QUESTIONS
+
+
+def _long_pause_duration(client: QuizBotClient) -> tuple[float, float]:
+    profile = getattr(client, "timing_profile", None)
+    if profile is not None:
+        return profile.long_pause_duration
+    return config.LONG_PAUSE_DURATION
+
+
 async def _wait_for_text(
     client: QuizBotClient,
     *needles: str,
@@ -210,14 +231,15 @@ async def upload_question(
         )
 
     # Пауза перед следующим вопросом (или перед /done)
-    pause = config.rand_delay(config.DELAY_BETWEEN_QUESTIONS)
+    pause = config.rand_delay(_delay_between_questions(client))
     log.info("Pausing %.1fs before next step", pause)
     await asyncio.sleep(pause)
 
-    if index_in_quiz > 0 and index_in_quiz % config.LONG_PAUSE_EVERY_N_QUESTIONS == 0:
-        long_pause = config.rand_delay(config.LONG_PAUSE_DURATION)
+    long_pause_every = _long_pause_every_n_questions(client)
+    if long_pause_every and index_in_quiz > 0 and index_in_quiz % long_pause_every == 0:
+        long_pause = config.rand_delay(_long_pause_duration(client))
         log.info("Long pause: %.1fs (every %d questions)",
-                 long_pause, config.LONG_PAUSE_EVERY_N_QUESTIONS)
+                 long_pause, long_pause_every)
         await asyncio.sleep(long_pause)
 
 
@@ -227,12 +249,18 @@ def _poll_options(
     shuffle_options: bool,
     shuffle_seed: int,
 ) -> tuple[list[str], list[int]]:
-    options = list(q.options)
     correct_values = q.correct if isinstance(q.correct, list) else [q.correct]
-    correct_answers = [options[correct - 1] for correct in correct_values]
+    correct_set = set(correct_values)
+    # Carry correctness as a per-option flag through the permutation so that
+    # duplicate option texts can never shift which option is correct.
+    paired = [
+        (option, (position + 1) in correct_set)
+        for position, option in enumerate(q.options)
+    ]
     if shuffle_options:
-        random.Random(f"{shuffle_seed}:{index_in_quiz}:{q.question}").shuffle(options)
-    correct_indexes = sorted(options.index(correct_answer) for correct_answer in correct_answers)
+        random.Random(f"{shuffle_seed}:{index_in_quiz}:{q.question}").shuffle(paired)
+    options = [option for option, _ in paired]
+    correct_indexes = [position for position, (_, is_correct) in enumerate(paired) if is_correct]
     return options, correct_indexes
 
 

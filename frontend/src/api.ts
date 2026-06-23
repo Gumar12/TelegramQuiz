@@ -12,6 +12,7 @@ import {
   TelegramLoginCodeResponse,
   TelegramLoginStartResponse,
   TelegramLoginStatusResponse,
+  WaitForJobOptions,
 } from './types';
 
 const API_BASE =
@@ -26,6 +27,24 @@ export function mediaUrl(path: string): string {
   const normalized = path.replace(/\\/g, '/').replace(/^\/+/, '');
   const encoded = normalized.split('/').map(encodeURIComponent).join('/');
   return `${API_BASE}/api/media/${encoded}`;
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Delay aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Delay aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -304,11 +323,17 @@ export const api = {
     return source;
   },
 
-  async waitForJob(jobId: string): Promise<JobSnapshot> {
+  async waitForJob(jobId: string, options: WaitForJobOptions = {}): Promise<JobSnapshot> {
+    const { signal, timeoutMs, pollMs = 300 } = options;
+    const deadline = timeoutMs && timeoutMs > 0 ? Date.now() + timeoutMs : null;
     for (;;) {
+      if (signal?.aborted) throw new DOMException('waitForJob aborted', 'AbortError');
       const snapshot = await api.getJob(jobId);
       if (snapshot.status !== 'running') return snapshot;
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      if (deadline !== null && Date.now() >= deadline) {
+        throw new DOMException('waitForJob timed out', 'TimeoutError');
+      }
+      await abortableDelay(pollMs, signal);
     }
   },
 };

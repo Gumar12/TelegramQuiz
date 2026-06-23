@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
 from backend import config
@@ -19,6 +22,8 @@ MAX_ENABLED_PROFILES = 2
 PROFILES_FILENAME = "profiles.json"
 ACTIVE_PROFILE_FILENAME = "active_profile.json"
 DEFAULT_PROFILE_ID = "default"
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
 
 
 class AccountProfileError(ValueError):
@@ -145,7 +150,7 @@ def create_profile(
     enabled_value = bool(enabled) and _enabled_count(data["profiles"]) < MAX_ENABLED_PROFILES
     now = _utc_now()
     session_path = _account_store_root(store_root, config_module=config_module) / "sessions" / f"{profile_id}.session"
-    session_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(session_path.parent)
     profile = _normalize_profile(
         {
             "id": profile_id,
@@ -429,10 +434,13 @@ def _load_store(
     store_root: str | Path | None,
     config_module: Any,
 ) -> dict[str, list[dict[str, Any]]]:
+    root = _account_store_root(store_root, config_module=config_module)
+    _ensure_account_store_dirs(root)
     profiles_path = _profiles_path(store_root, config_module=config_module)
     if profiles_path.exists():
         with profiles_path.open("r", encoding="utf-8") as fh:
             raw = json.load(fh)
+        _chmod_private_file(profiles_path)
     else:
         raw = {}
 
@@ -463,13 +471,12 @@ def _write_store(
     config_module: Any,
 ) -> None:
     root = _account_store_root(store_root, config_module=config_module)
-    root.mkdir(parents=True, exist_ok=True)
-    with _profiles_path(store_root, config_module=config_module).open(
-        "w",
-        encoding="utf-8",
-    ) as fh:
+    _ensure_account_store_dirs(root)
+    profiles_path = _profiles_path(store_root, config_module=config_module)
+    with _open_private_text_for_write(profiles_path) as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
+    _chmod_private_file(profiles_path)
 
 
 def _read_active_profile_id(
@@ -488,6 +495,7 @@ def _read_active_profile_id(
     if active_path.exists():
         with active_path.open("r", encoding="utf-8") as fh:
             raw = json.load(fh)
+        _chmod_private_file(active_path)
         profile_id = str(raw.get("active_profile_id") or "")
         if profile_id and _profile_is_selectable(
             data,
@@ -513,18 +521,17 @@ def _write_active_profile_id(
     config_module: Any,
 ) -> None:
     root = _account_store_root(store_root, config_module=config_module)
-    root.mkdir(parents=True, exist_ok=True)
+    _ensure_account_store_dirs(root)
     payload = {
         "active_profile_id": profile_id,
         "changed_at": _utc_now(),
         "changed_by": changed_by,
     }
-    with _active_profile_path(store_root, config_module=config_module).open(
-        "w",
-        encoding="utf-8",
-    ) as fh:
+    active_path = _active_profile_path(store_root, config_module=config_module)
+    with _open_private_text_for_write(active_path) as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
+    _chmod_private_file(active_path)
 
 
 def _clear_active_profile_id(
@@ -562,6 +569,7 @@ def _ensure_active_profile_file(
             profile_id,
             allow_disabled=True,
         ):
+            _chmod_private_file(active_path)
             return
     try:
         profile_id = _choose_active_profile_id(data, allow_disabled=False)
@@ -634,6 +642,104 @@ def _delete_session_files(session_path: Path) -> None:
                 candidate.unlink()
         except OSError:
             pass
+
+
+def _ensure_account_store_dirs(root: Path) -> None:
+    _ensure_private_dir(root)
+    _ensure_private_dir(root / "sessions")
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+    _chmod_private_dir(path)
+
+
+@contextmanager
+def _open_private_text_for_write(path: Path):
+    _ensure_private_dir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        if os.name == "posix":
+            tmp_path.chmod(PRIVATE_FILE_MODE)
+        with open(fd, "w", encoding="utf-8", closefd=True) as fh:
+            yield fh
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        _chmod_private_file(path)
+        _fsync_parent_dir(path.parent)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _chmod_private_dir(path: Path) -> None:
+    if os.name != "posix":
+        return
+    try:
+        path.chmod(PRIVATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def _chmod_private_file(path: Path) -> None:
+    if os.name != "posix":
+        return
+    try:
+        if path.exists() and path.is_file():
+            path.chmod(PRIVATE_FILE_MODE)
+    except OSError:
+        pass
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    if os.name != "posix":
+        return
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _chmod_session_files(session_path: Path) -> None:
+    if not str(session_path):
+        return
+    for candidate in _session_file_candidates(session_path):
+        _chmod_private_file(candidate)
+
+
+def _session_file_candidates(session_path: Path) -> list[Path]:
+    base_paths = [session_path]
+    if session_path.suffix != ".session":
+        base_paths.append(Path(f"{session_path}.session"))
+    candidates: list[Path] = []
+    for base_path in base_paths:
+        candidates.extend(
+            [
+                base_path,
+                base_path.with_name(f"{base_path.name}-journal"),
+                base_path.with_name(f"{base_path.name}-shm"),
+                base_path.with_name(f"{base_path.name}-wal"),
+            ]
+        )
+    return candidates
 
 
 def _clean_display_name(display_name: str) -> str:

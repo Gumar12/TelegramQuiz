@@ -214,3 +214,182 @@ def test_builder_drops_missing_media_ref_and_flags_it(tmp_path: Path):
     question = quiz["questions"][0]
     assert question["media"] == []
     assert any("missing_source_blocks" in flag and "img0001:media/missing.jpg" in flag for flag in question["quality_flags"])
+
+
+def _basic_source() -> SourceBlocks:
+    return SourceBlocks(
+        document_id="source",
+        blocks={
+            "b0001": SourceBlock("b0001", "paragraph", "Вопрос?"),
+            "b0002": SourceBlock("b0002", "option", "A) Верно"),
+            "b0003": SourceBlock("b0003", "option", "B) Неверно"),
+            "b0004": SourceBlock("b0004", "option", "C) Тоже неверно"),
+        },
+        images={
+            "img0001": SourceBlock("img0001", "image", media_refs=["media/image1.png"]),
+        },
+        order=["b0001", "img0001", "b0002", "b0003", "b0004"],
+    )
+
+
+def test_builder_rejects_unknown_block_id_as_flag_not_crash():
+    source = _basic_source()
+    markup = {
+        "questions": [
+            {
+                "id": "q001",
+                # b9999 is not in the known extracted set.
+                "question_block_ids": ["b0001", "b9999"],
+                "option_block_ids": ["b0002", "b0003", "b0004"],
+                # Unknown correct id must be rejected, not silently trusted.
+                "correct_option_block_ids": ["b9999"],
+            }
+        ],
+    }
+
+    quiz = build_quiz_from_markup(markup, source)
+
+    question = quiz["questions"][0]
+    flags = question["quality_flags"]
+    assert any("missing_source_blocks" in flag and "b9999" in flag for flag in flags)
+    # Unknown correct id was rejected, so no valid correct answer was found.
+    assert any("не нашёл правильный ответ" in flag for flag in flags)
+
+
+def test_builder_rejects_absolute_media_ref_outside_trusted_root(tmp_path: Path):
+    # A real file outside the media output dir and its workspace parent.
+    outside = tmp_path / "secret"
+    outside.mkdir()
+    secret = outside / "passwd.png"
+    secret.write_bytes(b"image-bytes")
+    media_dir = tmp_path / "workspace" / "media"
+    media_dir.mkdir(parents=True)
+
+    source = SourceBlocks(
+        document_id="source",
+        blocks={
+            "b0001": SourceBlock("b0001", "paragraph", "Вопрос?"),
+            "b0002": SourceBlock("b0002", "option", "A) Верно"),
+            "b0003": SourceBlock("b0003", "option", "B) Неверно"),
+            "b0004": SourceBlock("b0004", "option", "C) Тоже неверно"),
+        },
+        images={
+            "img0001": SourceBlock("img0001", "image", media_refs=[str(secret)]),
+        },
+        order=["b0001", "img0001", "b0002", "b0003", "b0004"],
+    )
+    markup = {
+        "questions": [
+            {
+                "id": "q001",
+                "question_block_ids": ["b0001"],
+                "option_block_ids": ["b0002", "b0003", "b0004"],
+                "correct_option_block_ids": ["b0002"],
+                "media_ids": ["img0001"],
+            }
+        ],
+    }
+
+    quiz = build_quiz_from_markup(markup, source, media_output_dir=media_dir)
+
+    question = quiz["questions"][0]
+    assert question["media"] == []
+    assert any("missing_source_blocks" in flag and "img0001" in flag for flag in question["quality_flags"])
+
+
+def test_builder_rejects_parent_traversal_media_ref(tmp_path: Path):
+    media_dir = tmp_path / "workspace" / "media"
+    media_dir.mkdir(parents=True)
+    # A real file two levels up, reachable only by escaping the trusted roots.
+    escape_target = tmp_path / "outside.png"
+    escape_target.write_bytes(b"image-bytes")
+
+    source = SourceBlocks(
+        document_id="source",
+        blocks={
+            "b0001": SourceBlock("b0001", "paragraph", "Вопрос?"),
+            "b0002": SourceBlock("b0002", "option", "A) Верно"),
+            "b0003": SourceBlock("b0003", "option", "B) Неверно"),
+            "b0004": SourceBlock("b0004", "option", "C) Тоже неверно"),
+        },
+        images={
+            "img0001": SourceBlock("img0001", "image", media_refs=["../../outside.png"]),
+        },
+        order=["b0001", "img0001", "b0002", "b0003", "b0004"],
+    )
+    markup = {
+        "questions": [
+            {
+                "id": "q001",
+                "question_block_ids": ["b0001"],
+                "option_block_ids": ["b0002", "b0003", "b0004"],
+                "correct_option_block_ids": ["b0002"],
+                "media_ids": ["img0001"],
+            }
+        ],
+    }
+
+    quiz = build_quiz_from_markup(markup, source, media_output_dir=media_dir)
+
+    question = quiz["questions"][0]
+    assert question["media"] == []
+    assert any("missing_source_blocks" in flag and "img0001" in flag for flag in question["quality_flags"])
+
+
+def test_builder_rejects_disallowed_media_suffix(tmp_path: Path):
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    (media_dir / "payload.exe").write_bytes(b"not-an-image")
+
+    source = SourceBlocks(
+        document_id="source",
+        blocks={
+            "b0001": SourceBlock("b0001", "paragraph", "Вопрос?"),
+            "b0002": SourceBlock("b0002", "option", "A) Верно"),
+            "b0003": SourceBlock("b0003", "option", "B) Неверно"),
+            "b0004": SourceBlock("b0004", "option", "C) Тоже неверно"),
+        },
+        images={
+            "img0001": SourceBlock("img0001", "image", media_refs=["media/payload.exe"]),
+        },
+        order=["b0001", "img0001", "b0002", "b0003", "b0004"],
+    )
+    markup = {
+        "questions": [
+            {
+                "id": "q001",
+                "question_block_ids": ["b0001"],
+                "option_block_ids": ["b0002", "b0003", "b0004"],
+                "correct_option_block_ids": ["b0002"],
+                "media_ids": ["img0001"],
+            }
+        ],
+    }
+
+    quiz = build_quiz_from_markup(markup, source, media_output_dir=media_dir)
+
+    question = quiz["questions"][0]
+    assert question["media"] == []
+    assert any("missing_source_blocks" in flag and "img0001" in flag for flag in question["quality_flags"])
+
+
+def test_builder_rejects_unknown_media_id_as_flag_not_crash():
+    source = _basic_source()
+    markup = {
+        "questions": [
+            {
+                "id": "q001",
+                "question_block_ids": ["b0001"],
+                "option_block_ids": ["b0002", "b0003", "b0004"],
+                "correct_option_block_ids": ["b0002"],
+                # img9999 is not a known extracted media id.
+                "media_ids": ["img9999"],
+            }
+        ],
+    }
+
+    quiz = build_quiz_from_markup(markup, source)
+
+    question = quiz["questions"][0]
+    assert question["media"] == []
+    assert any("missing_source_blocks" in flag and "img9999" in flag for flag in question["quality_flags"])

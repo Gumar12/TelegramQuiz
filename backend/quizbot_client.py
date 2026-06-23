@@ -13,7 +13,7 @@
 import asyncio
 import inspect
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -44,6 +44,25 @@ log = logging.getLogger(__name__)
 CorrectIndexes = int | list[int]
 
 
+class FloodWaitCapExceeded(RuntimeError):
+    """FloodWait дольше порога: не спим часами, а отдаём наверх с retry-after.
+
+    Несёт actionable-метаданные (`retry_after`/`cooldown_seconds`), чтобы
+    оркестратор поставил run на контролируемую паузу/кулдаун.
+    """
+
+    def __init__(self, retry_after: int, cap_seconds: float, *, context: str = ""):
+        self.retry_after = retry_after
+        self.seconds = retry_after  # совместимость с classify-ветками FloodWait
+        self.cooldown_seconds = retry_after
+        self.cap_seconds = cap_seconds
+        suffix = f" on {context}" if context else ""
+        super().__init__(
+            f"FloodWait {retry_after}s exceeds cap {cap_seconds:g}s{suffix}: "
+            "controlled pause required"
+        )
+
+
 try:
     from telethon.tl.types import TextWithEntities
 
@@ -64,6 +83,8 @@ class QuizBotClient:
         api_id: int | None = None,
         api_hash: str | None = None,
         phone: str | None = None,
+        timing_profile: config.TimingProfile | None = None,
+        session_chmod_callback: Callable[[], None] | None = None,
     ):
         self.session_name = (
             session_name if session_name is not None else config.SESSION_NAME
@@ -71,31 +92,90 @@ class QuizBotClient:
         self.api_id = api_id if api_id is not None else config.API_ID
         self.api_hash = api_hash if api_hash is not None else config.API_HASH
         self.phone = phone if phone is not None else config.PHONE
+        self.timing_profile = timing_profile
+        self._session_chmod_callback = session_chmod_callback
         self.client = TelegramClient(self.session_name, self.api_id, self.api_hash)
         self._conv: Optional[Conversation] = None
         self.last_reply: Optional[Message] = None
 
     async def __aenter__(self) -> "QuizBotClient":
-        await self.client.start(phone=self.phone)
-        log.info("Telegram session started")
-        self._conv = self.client.conversation(
-            config.BOT_USERNAME,
-            timeout=config.WAIT_REPLY_TIMEOUT,
-            exclusive=True,
-        )
-        await self._conv.__aenter__()
-        log.info("Opened conversation with @%s", config.BOT_USERNAME)
-        return self
+        try:
+            await self.client.start(phone=self.phone)
+        except BaseException:
+            try:
+                await self.client.disconnect()
+            finally:
+                self._chmod_session_files()
+            raise
+
+        try:
+            self._chmod_session_files()
+            log.info("Telegram session started")
+            self._conv = self.client.conversation(
+                config.BOT_USERNAME,
+                timeout=config.WAIT_REPLY_TIMEOUT,
+                exclusive=True,
+            )
+            await self._conv.__aenter__()
+            log.info("Opened conversation with @%s", config.BOT_USERNAME)
+            return self
+        except BaseException:
+            try:
+                await self.client.disconnect()
+            finally:
+                self._chmod_session_files()
+            raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._conv is not None:
-            await self._conv.__aexit__(exc_type, exc_val, exc_tb)
-        await self.client.disconnect()
-        log.info("Telegram session closed")
+        try:
+            if self._conv is not None:
+                await self._conv.__aexit__(exc_type, exc_val, exc_tb)
+        finally:
+            try:
+                await self.client.disconnect()
+            finally:
+                self._chmod_session_files()
+                log.info("Telegram session closed")
+
+    def _chmod_session_files(self) -> None:
+        if self._session_chmod_callback is not None:
+            self._session_chmod_callback()
+
+    def _delay_between_messages(self) -> tuple[float, float]:
+        timing_profile = getattr(self, "timing_profile", None)
+        if timing_profile is not None:
+            return timing_profile.delay_between_messages
+        return config.DELAY_BETWEEN_MESSAGES
+
+    def _flood_wait_max_seconds(self) -> float:
+        timing_profile = getattr(self, "timing_profile", None)
+        if timing_profile is not None:
+            return timing_profile.flood_wait_max_seconds
+        return config.FLOOD_WAIT_MAX_SECONDS
+
+    async def _handle_flood_wait(self, e: FloodWaitError, attempt: int, context: str) -> None:
+        """Обрабатывает один FloodWait внутри retry-цикла.
+
+        Выше порога — поднимает FloodWaitCapExceeded (без многочасового сна).
+        Ниже порога — bounded-сон с джиттером, после чего цикл делает ретрай.
+        """
+        cap = self._flood_wait_max_seconds()
+        if e.seconds > cap:
+            log.warning(
+                "FloodWait %ds exceeds cap %gs on %s — classifying as controlled pause",
+                e.seconds, cap, context,
+            )
+            raise FloodWaitCapExceeded(e.seconds, cap, context=context) from e
+        wait = e.seconds + config.rand_delay(config.FLOOD_WAIT_RETRY_JITTER)
+        log.warning(
+            "FloodWait %ds on %s (attempt %d/%d) — sleeping %.1fs",
+            e.seconds, context, attempt + 1, config.MAX_RETRIES_ON_FLOOD, wait,
+        )
+        await asyncio.sleep(wait)
 
     async def send_text(self, text: str) -> Message:
         """Шлёт текст в @QuizBot с задержкой и FloodWait-обработкой."""
-        await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        await asyncio.sleep(config.rand_delay(self._delay_between_messages()))
         last_exc: Optional[Exception] = None
         for attempt in range(config.MAX_RETRIES_ON_FLOOD):
             try:
@@ -104,17 +184,12 @@ class QuizBotClient:
                 return msg
             except FloodWaitError as e:
                 last_exc = e
-                wait = e.seconds + 2
-                log.warning(
-                    "FloodWait %ds (attempt %d/%d) — sleeping",
-                    e.seconds, attempt + 1, config.MAX_RETRIES_ON_FLOOD,
-                )
-                await asyncio.sleep(wait)
+                await self._handle_flood_wait(e, attempt, "text")
         raise RuntimeError(f"FloodWait retries exhausted: {last_exc}")
 
     async def send_media(self, path: str, caption: str = "") -> Message:
         """Шлёт локальный медиафайл в @QuizBot как pre-question сообщение."""
-        await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        await asyncio.sleep(config.rand_delay(self._delay_between_messages()))
         if self._conv is None:
             raise RuntimeError("QuizBot conversation is not open")
         last_exc: Optional[Exception] = None
@@ -128,12 +203,7 @@ class QuizBotClient:
                 return msg
             except FloodWaitError as e:
                 last_exc = e
-                wait = e.seconds + 2
-                log.warning(
-                    "FloodWait %ds on media (attempt %d/%d) — sleeping",
-                    e.seconds, attempt + 1, config.MAX_RETRIES_ON_FLOOD,
-                )
-                await asyncio.sleep(wait)
+                await self._handle_flood_wait(e, attempt, "media")
         raise RuntimeError(f"FloodWait retries exhausted on media: {last_exc}")
 
     async def send_quiz_poll(
@@ -150,7 +220,7 @@ class QuizBotClient:
         solution — пояснение, видно только если quiz=True (поддерживается ботом).
         Возвращает Message с отправленным poll-ом (нужен для возможного SendVote).
         """
-        await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        await asyncio.sleep(config.rand_delay(self._delay_between_messages()))
         if self._conv is None:
             raise RuntimeError("QuizBot conversation is not open")
         normalized_correct_indexes = _normalize_correct_indexes(
@@ -195,12 +265,7 @@ class QuizBotClient:
                 return msg
             except FloodWaitError as e:
                 last_exc = e
-                wait = e.seconds + 2
-                log.warning(
-                    "FloodWait %ds on poll (attempt %d/%d) — sleeping",
-                    e.seconds, attempt + 1, config.MAX_RETRIES_ON_FLOOD,
-                )
-                await asyncio.sleep(wait)
+                await self._handle_flood_wait(e, attempt, "poll")
         raise RuntimeError(f"FloodWait retries exhausted on poll: {last_exc}")
 
     async def vote_poll(self, poll_msg: Message, option_indexes: CorrectIndexes) -> None:
@@ -210,7 +275,7 @@ class QuizBotClient:
         просит проголосовать за правильный ответ.
         """
         normalized_option_indexes = _normalize_correct_indexes(option_indexes)
-        await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        await asyncio.sleep(config.rand_delay(self._delay_between_messages()))
         await self.client(SendVoteRequest(
             peer=config.BOT_USERNAME,
             msg_id=poll_msg.id,
@@ -236,7 +301,7 @@ class QuizBotClient:
         index: Optional[int] = None,
     ) -> None:
         """Нажимает inline-кнопку по тексту или индексу."""
-        await asyncio.sleep(config.rand_delay(config.DELAY_BETWEEN_MESSAGES))
+        await asyncio.sleep(config.rand_delay(self._delay_between_messages()))
         if text is not None:
             await msg.click(text=text)
             log.info("⌘ clicked button: %r", text)

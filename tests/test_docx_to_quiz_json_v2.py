@@ -1,7 +1,11 @@
 from docx import Document
 
 from backend.docx_to_quiz_json_v2 import (
+    OPTION_MAX_CHARS,
+    attach_distractors,
+    build_output,
     compact_for_option,
+    count_unsupported_media,
     format_group_summary,
     iter_docx_blocks,
     parse_args,
@@ -543,3 +547,111 @@ def test_parse_blocks_keeps_multiline_quote_as_context_not_question():
     assert "Когда нам удастся сесть" not in [item["question"] for item in items]
     assert all("Турсуна" in item["context"] for item in items[:3])
     assert all("Когда нам удастся сесть" in item["context"] for item in items[3:])
+
+
+def test_oversize_bold_correct_answer_is_flagged_not_crashing_other_questions():
+    long_answer = "О" * (OPTION_MAX_CHARS + 20)
+    blocks = [
+        {"type": "text", "text": "Слишком длинный готовый вопрос:"},
+        {"type": "text", "text": "A) короткий неверный"},
+        {
+            "type": "text",
+            "text": f"B) {long_answer}",
+            "bold_text": f"B) {long_answer}",
+            "has_bold": True,
+        },
+        {"type": "text", "text": "Кто считается основателем Казахского ханства?"},
+        {"type": "text", "text": "A) Абылай хан"},
+        {
+            "type": "text",
+            "text": "B) Керей и Жанибек",
+            "bold_text": "Керей и Жанибек",
+            "has_bold": True,
+        },
+        {"type": "text", "text": "C) Кенесары хан"},
+        {"type": "text", "text": "D) Тауке хан"},
+    ]
+
+    items = parse_blocks_to_items(blocks)
+
+    # Один oversize вопрос помечен на ревью и не уронил парсинг остальных.
+    assert len(items) == 2
+    assert items[0]["type"] == "needs_option_length_review"
+    assert items[0]["correct_answer"] == long_answer  # текст не обрезан, не потерян
+    # Следующий нормальный вопрос распарсен корректно.
+    assert items[1]["type"] == "multiple_choice"
+    assert items[1]["correct_answer"] == "Керей и Жанибек"
+
+
+def test_attach_distractors_flags_oversize_correct_answer_instead_of_building_option():
+    long_answer = "Я" * (OPTION_MAX_CHARS + 5)
+    items = attach_distractors(
+        [
+            {
+                "question": "Локальный вопрос про хана",
+                "correct_answer": long_answer,
+                "options": [],
+            }
+        ]
+    )
+
+    assert len(items) == 1
+    # attach_distractors не должен делать oversize-ответ вариантом опроса —
+    # текст не теряется, вопрос помечается на ревью.
+    assert items[0]["correct_answer"] == long_answer
+    assert items[0]["type"] == "needs_option_length_review"
+    assert items[0]["options"] == []
+    assert items[0]["correct"] is None
+    assert items[0]["distractors_source"] == "needs_option_length_review"
+
+
+def test_count_unsupported_media_detects_image_inside_table(tmp_path):
+    doc = Document()
+    table = doc.add_table(rows=1, cols=1)
+    cell_paragraph = table.cell(0, 0).paragraphs[0]
+    run = cell_paragraph.add_run()
+    image_path = tmp_path / "pic.png"
+    # Minimal 1x1 PNG bytes.
+    image_path.write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108020000009077"
+            "53de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049"
+            "454e44ae426082"
+        )
+    )
+    run.add_picture(str(image_path))
+
+    assert count_unsupported_media(doc) == 1
+
+
+def test_build_output_reports_unsupported_table_media_warning(tmp_path):
+    doc = Document()
+    doc.add_paragraph("11 мая")
+    doc.add_paragraph("Кто считается основателем Казахского ханства?")
+    doc.add_paragraph("Керей и Жанибек")
+    table = doc.add_table(rows=1, cols=1)
+    run = table.cell(0, 0).paragraphs[0].add_run()
+    image_path = tmp_path / "pic.png"
+    image_path.write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108020000009077"
+            "53de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049"
+            "454e44ae426082"
+        )
+    )
+    run.add_picture(str(image_path))
+
+    docx_path = tmp_path / "with_table_media.docx"
+    doc.save(docx_path)
+
+    data = build_output(
+        docx_path,
+        tmp_path / "out.json",
+        tmp_path / "media",
+        "T",
+        "D",
+    )
+
+    assert data["report"]["unsupported_media_locations"] == 1
+    assert "warnings" in data["report"]
+    assert "таблиц" in data["report"]["warnings"][0]

@@ -75,7 +75,7 @@ async def run(
     cancel_check: Callable[[], None] | None = None,
 ) -> int:
     log = logging.getLogger("main")
-    config.apply_speed_mode(speed)
+    timing_profile = config.build_timing_profile(speed)
     log.info("Speed mode: %s", speed)
     log.info("Loading questions from %s", file_path)
     questions = load_json(file_path)
@@ -89,7 +89,7 @@ async def run(
 
     config.assert_credentials()
     log.info("Connecting to Telegram as %s …", config.PHONE)
-    async with QuizBotClient() as client:
+    async with QuizBotClient(timing_profile=timing_profile) as client:
         try:
             if progress_callback:
                 progress_callback("creating", 0, len(questions), "Creating quiz draft in @QuizBot")

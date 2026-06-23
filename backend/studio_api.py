@@ -9,12 +9,13 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -53,6 +54,19 @@ DEFAULT_MEDIA_DIR = config.DATA_DIR / MEDIA_DIRNAME
 DEFAULT_OUTPUT_DIR = config.DATA_DIR / OUTPUT_DIRNAME
 MEDIA_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
+# Max wall-clock lifetime of a single job-events (SSE) stream. The stream only
+# observes the job; hitting this bound closes the stream without cancelling the
+# underlying job thread, so a stale/forgotten client cannot loop forever.
+JOB_EVENTS_STREAM_MAX_AGE_SECONDS = 30 * 60
+
+
+@dataclass(frozen=True)
+class WorkspaceContext:
+    workspace_dir: Path
+    source_path: Path
+    media_dir: Path
+    quizzes_dir: Path
+
 
 def _setup_logging() -> None:
     if getattr(_setup_logging, "_configured", False):
@@ -83,13 +97,57 @@ def _resolve_path(value: str | Path | None, default: str | Path = ".") -> Path:
     return Path(raw).expanduser()
 
 
-def _workspace_paths(workspace_dir: str | Path | None) -> tuple[Path, Path, Path, Path]:
-    workspace = _resolve_path(workspace_dir, config.DATA_DIR)
-    return (
-        workspace,
-        workspace / SOURCE_FILENAME,
-        workspace / MEDIA_DIRNAME,
-        workspace / OUTPUT_DIRNAME,
+def _invalid_workspace_dir() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail="workspace_dir must be a relative path inside the server data directory",
+    )
+
+
+def _resolve_workspace_dir(workspace_dir: str | Path, default_workspace_dir: str | Path) -> Path:
+    raw = str(workspace_dir).strip()
+    normalized = raw.replace("\\", "/")
+    candidate_input = Path(normalized)
+    windows_input = PureWindowsPath(raw)
+    if (
+        not normalized
+        or candidate_input.is_absolute()
+        or windows_input.is_absolute()
+        or windows_input.drive
+        or any(part == ".." for part in candidate_input.parts)
+    ):
+        raise _invalid_workspace_dir()
+
+    root = _resolve_path(default_workspace_dir, config.DATA_DIR).resolve(strict=False)
+    candidate = (root / candidate_input).resolve(strict=False)
+    if not _is_relative_to(candidate, root):
+        raise _invalid_workspace_dir()
+    return candidate
+
+
+def _workspace_context(
+    workspace_dir: str | Path | None,
+    *,
+    default_workspace_dir: str | Path = config.DATA_DIR,
+    default_source_path: str | Path | None = None,
+    default_media_dir: str | Path | None = None,
+    default_quizzes_dir: str | Path | None = None,
+) -> WorkspaceContext:
+    if workspace_dir is None or str(workspace_dir).strip() == "":
+        workspace = _resolve_path(default_workspace_dir, config.DATA_DIR)
+        return WorkspaceContext(
+            workspace_dir=workspace,
+            source_path=Path(default_source_path) if default_source_path is not None else workspace / SOURCE_FILENAME,
+            media_dir=Path(default_media_dir) if default_media_dir is not None else workspace / MEDIA_DIRNAME,
+            quizzes_dir=Path(default_quizzes_dir) if default_quizzes_dir is not None else workspace / OUTPUT_DIRNAME,
+        )
+
+    workspace = _resolve_workspace_dir(workspace_dir, default_workspace_dir)
+    return WorkspaceContext(
+        workspace_dir=workspace,
+        source_path=workspace / SOURCE_FILENAME,
+        media_dir=workspace / MEDIA_DIRNAME,
+        quizzes_dir=workspace / OUTPUT_DIRNAME,
     )
 
 
@@ -149,7 +207,7 @@ class UploadRequest(BaseModel):
 class CreateManualQuizRequest(BaseModel):
     title: str = "Новый квиз"
     description: str = ""
-    workspace_dir: str = "."
+    workspace_dir: str | None = None
 
 
 class UseAccountProfileRequest(BaseModel):
@@ -443,8 +501,26 @@ def _studio_upload_replace_active(runtime_dir: Path, *, confirm_replace_active: 
         return False
     try:
         active_run = store.load_run(active_run_id)
-    except runs.RunStoreError:
+    except (runs.RunNotFoundError, runs.ActiveRunNotFoundError):
+        # The pointer references a run that no longer exists: genuinely no
+        # active run to protect.
         return False
+    except (runs.RunStoreError, json.JSONDecodeError, OSError, ValueError) as exc:
+        # An unreadable/corrupt active run must BLOCK the replace, never be
+        # silently treated as "no protection" — that would bypass the
+        # protected-run gate.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "active_run_unreadable",
+                "message": (
+                    "Active upload run state is unreadable or corrupt; "
+                    "resolve it before replacing the active run."
+                ),
+                "required_action": "inspect_active_run",
+                "active_run_id": active_run_id,
+            },
+        ) from exc
     if _is_terminal_run(active_run):
         return True
     if not runs.has_protected_progress(active_run):
@@ -1305,11 +1381,13 @@ def create_app(
 
     @app.post("/api/groups/manual")
     def create_manual_group(request: CreateManualQuizRequest) -> dict[str, Any]:
-        workspace_dir_path, source_path, media_dir, quizzes_dir = _workspace_paths(request.workspace_dir)
-        app.state.workspace_dir = workspace_dir_path
-        app.state.source_path = source_path
-        app.state.media_dir = media_dir
-        app.state.quizzes_dir = quizzes_dir
+        ctx = _workspace_context(
+            request.workspace_dir,
+            default_workspace_dir=app.state.workspace_dir,
+            default_source_path=app.state.source_path,
+            default_media_dir=app.state.media_dir,
+            default_quizzes_dir=app.state.quizzes_dir,
+        )
 
         title = request.title.strip() or "Новый квиз"
         group_id = _manual_quiz_id(title)
@@ -1323,7 +1401,7 @@ def create_app(
                 "status": "draft",
                 "questions": [],
             },
-            quizzes_dir,
+            ctx.quizzes_dir,
         )
         return {"group": group}
 
@@ -1332,7 +1410,7 @@ def create_app(
         file: UploadFile = File(...),
         title: str = Form(""),
         description: str = Form("Импортировано из JSON"),
-        workspace_dir: str = Form("."),
+        workspace_dir: str | None = Form(None),
     ) -> dict[str, Any]:
         suffix = Path(file.filename or "upload.json").suffix.lower()
         if suffix != ".json":
@@ -1346,11 +1424,13 @@ def create_app(
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc.msg}") from exc
 
-        workspace_dir_path, source_path, media_dir, quizzes_dir = _workspace_paths(workspace_dir)
-        app.state.workspace_dir = workspace_dir_path
-        app.state.source_path = source_path
-        app.state.media_dir = media_dir
-        app.state.quizzes_dir = quizzes_dir
+        ctx = _workspace_context(
+            workspace_dir,
+            default_workspace_dir=app.state.workspace_dir,
+            default_source_path=app.state.source_path,
+            default_media_dir=app.state.media_dir,
+            default_quizzes_dir=app.state.quizzes_dir,
+        )
 
         fallback_title = Path(file.filename or "imported_quiz").stem
         quiz_title = title.strip() or _json_import_title(payload, fallback_title)
@@ -1359,7 +1439,7 @@ def create_app(
             group = studio_storage.import_group_payload(
                 group_id,
                 payload,
-                quizzes_dir,
+                ctx.quizzes_dir,
                 title=quiz_title,
                 description=description,
             )
@@ -1728,7 +1808,10 @@ def create_app(
 
     @app.put("/api/groups/{group_id}")
     def save_group(group_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return studio_storage.save_group(group_id, payload, app.state.quizzes_dir)
+        try:
+            return studio_storage.save_group(group_id, payload, app.state.quizzes_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/groups/{group_id}/archive")
     def archive_group(group_id: str) -> dict[str, Any]:
@@ -1749,20 +1832,22 @@ def create_app(
         file: UploadFile = File(...),
         title: str = Form("Новый квиз"),
         description: str = Form("Создано из DOCX локальным парсером"),
-        workspace_dir: str = Form("."),
+        workspace_dir: str | None = Form(None),
         use_ai: bool = Form(False),
     ) -> dict[str, Any]:
         suffix = Path(file.filename or "upload.docx").suffix or ".docx"
         if suffix.lower() != ".docx":
             raise HTTPException(status_code=400, detail="Only DOCX files are supported")
 
-        workspace_dir_path, source_path, media_dir, quizzes_dir = _workspace_paths(workspace_dir)
-        app.state.workspace_dir = workspace_dir_path
-        app.state.source_path = source_path
-        app.state.media_dir = media_dir
-        app.state.quizzes_dir = quizzes_dir
+        ctx = _workspace_context(
+            workspace_dir,
+            default_workspace_dir=app.state.workspace_dir,
+            default_source_path=app.state.source_path,
+            default_media_dir=app.state.media_dir,
+            default_quizzes_dir=app.state.quizzes_dir,
+        )
 
-        upload_dir = workspace_dir_path / UPLOAD_DIRNAME
+        upload_dir = ctx.workspace_dir / UPLOAD_DIRNAME
         upload_dir.mkdir(parents=True, exist_ok=True)
         target = upload_dir / f"{int(time.time())}{suffix}"
         with target.open("wb") as fh:
@@ -1773,10 +1858,10 @@ def create_app(
                 "create-from-docx-ai",
                 _create_from_docx_ai_job(
                     docx_path=target,
-                    source_path=source_path,
-                    media_dir=media_dir,
-                    output_dir=quizzes_dir,
-                    workspace_dir=workspace_dir_path,
+                    source_path=ctx.source_path,
+                    media_dir=ctx.media_dir,
+                    output_dir=ctx.quizzes_dir,
+                    workspace_dir=ctx.workspace_dir,
                     title=title,
                     description=description,
                 ),
@@ -1787,9 +1872,9 @@ def create_app(
             "create-from-docx",
             _create_from_docx_job(
                 docx_path=target,
-                source_path=source_path,
-                media_dir=media_dir,
-                output_dir=quizzes_dir,
+                source_path=ctx.source_path,
+                media_dir=ctx.media_dir,
+                output_dir=ctx.quizzes_dir,
                 title=title,
                 description=description,
             ),
@@ -1847,18 +1932,25 @@ def create_app(
         return _require_job(app.state.manager, job_id)
 
     @app.get("/api/jobs/{job_id}/events")
-    async def job_events(job_id: str) -> StreamingResponse:
+    async def job_events(job_id: str, request: Request) -> StreamingResponse:
         _require_job(app.state.manager, job_id)
 
         async def event_stream():
             index = 0
+            deadline = time.monotonic() + JOB_EVENTS_STREAM_MAX_AGE_SECONDS
             while True:
+                # The stream only observes the job; closing it (disconnect or
+                # max-age timeout) never cancels the underlying job thread.
+                if await request.is_disconnected():
+                    break
                 events = app.state.manager.events_since(job_id, index)
                 for event in events:
                     index = event["index"] + 1
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 snapshot = app.state.manager.snapshot(job_id)
                 if snapshot["status"] in {"completed", "failed", "cancelled"} and not events:
+                    break
+                if time.monotonic() >= deadline:
                     break
                 await asyncio.sleep(0.5)
 

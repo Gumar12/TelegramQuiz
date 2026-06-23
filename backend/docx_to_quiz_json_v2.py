@@ -50,6 +50,11 @@ STATEMENT_SELECTION_PROMPTS = (
 QUOTE_OPENERS = ("«", '"', "“")
 QUOTE_CLOSERS = ("»", '"', "”")
 
+# Telegram poll option hard limit (см. telegram_limits.option_max_chars в build_output).
+# Ответ длиннее этого нельзя отдать как вариант опроса — такой вопрос помечаем на ревью,
+# а не молча обрезаем текст.
+OPTION_MAX_CHARS = 100
+
 
 def clean(text: str) -> str:
     text = text.replace("\xa0", " ")
@@ -82,6 +87,24 @@ def run_is_bold(run: Any) -> bool:
     style = getattr(run, "style", None)
     font = getattr(style, "font", None)
     return bool(getattr(font, "bold", False))
+
+
+def count_unsupported_media(doc: Any) -> int:
+    """Count drawings living in locations this parser does not traverse.
+
+    iter_docx_blocks обходит только параграфы тела документа. Картинки внутри
+    таблиц и текстовых блоков (textbox) сейчас НЕ извлекаются — чтобы это не было
+    молчаливой потерей, мы их пересчитываем и выносим в report как предупреждение.
+    """
+    count = 0
+    for table in getattr(doc, "tables", []):
+        count += len(table._element.xpath(".//w:drawing"))
+    body = getattr(getattr(doc, "element", None), "body", None)
+    if body is not None:
+        # Картинки внутри текстовых блоков (mc:AlternateContent / w:txbxContent),
+        # не привязанные к обычным run'ам параграфов тела.
+        count += len(body.xpath(".//w:txbxContent//w:drawing"))
+    return count
 
 
 def iter_docx_blocks(docx_path: str | Path, media_dir: str | Path) -> list[dict[str, Any]]:
@@ -550,6 +573,15 @@ def attach_distractors(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not correct_answer:
             continue
 
+        # Oversize correct_answer нельзя сделать вариантом опроса — флагуем вопрос,
+        # а не молча обрезаем (см. OPTION_MAX_CHARS).
+        if len(correct_answer) > OPTION_MAX_CHARS:
+            item["type"] = "needs_option_length_review"
+            item["options"] = []
+            item["correct"] = None
+            item["distractors_source"] = "needs_option_length_review"
+            continue
+
         distractors = contextual_distractors(item)
         if len(distractors) < 3:
             item["type"] = "needs_distractor_review"
@@ -619,8 +651,15 @@ def parse_blocks_to_items(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             correct = None
             correct_answer = ""
+        # Защита от oversize correct_answer: один слишком длинный верный вариант не
+        # должен ронять/портить весь файл — помечаем именно этот вопрос на ревью,
+        # текст не обрезаем (см. OPTION_MAX_CHARS).
+        oversize_answer = bool(correct_answer) and len(correct_answer) > OPTION_MAX_CHARS
+
         item_type = (
-            "multiple_answer"
+            "needs_option_length_review"
+            if oversize_answer and correct
+            else "multiple_answer"
             if len(correct_answers) > 1
             else guess_question_type(
                 pending_question,
@@ -1016,6 +1055,7 @@ def build_output(
 ) -> dict[str, Any]:
     blocks = iter_docx_blocks(docx_path, media_dir)
     items = parse_blocks_to_items(blocks)
+    unsupported_media = count_unsupported_media(Document(docx_path))
     report = {
         "blocks_total": len(blocks),
         "items_total": len(items),
@@ -1023,10 +1063,20 @@ def build_output(
         "items_needs_review": sum(
             1 for item in items if str(item.get("type", "")).startswith("needs_")
         ),
+        "items_needs_option_length_review": sum(
+            1 for item in items if item.get("type") == "needs_option_length_review"
+        ),
         "items_with_long_explanation": sum(
             1 for item in items if len(item.get("explanation_full", "")) > 200
         ),
+        "unsupported_media_locations": unsupported_media,
     }
+    if unsupported_media:
+        report["warnings"] = [
+            f"Найдено {unsupported_media} изображений в таблицах/текстовых блоках — "
+            "они НЕ извлечены (поддерживается только медиа в параграфах тела документа). "
+            "Проверьте источник вручную."
+        ]
     data = {
         "quiz_title": title,
         "quiz_description": description,

@@ -26,6 +26,7 @@ from backend.pipeline.validation import validate_clean_quiz
 
 FAST_THRESHOLD_POLICY = "fast-threshold"
 REPORT_FILENAME = "speed-probe-report.json"
+_PROBE_SPEED_PRESET = "fast"
 
 
 class SpeedProbeError(ValueError):
@@ -38,6 +39,16 @@ class SpeedProbePolicyError(SpeedProbeError):
 
 class SpeedProbeStateError(SpeedProbeError):
     """Raised when a stored run cannot be resumed as a speed probe."""
+
+
+class SpeedProbeActiveProfileError(SpeedProbeError):
+    """Raised when a probe would silently burn the active/default profile.
+
+    A speed probe deliberately runs at the fast threshold and can trip Telegram
+    limits on whatever account it touches. To avoid quietly spending the limits
+    of the active production profile, the caller must either select an explicit
+    profile or opt in to probing the active one.
+    """
 
 
 class FlowPrimitives(Protocol):
@@ -177,13 +188,24 @@ class SpeedProbeService:
         question_count: int,
         policy: str = FAST_THRESHOLD_POLICY,
         account_profile_id: str | None = None,
+        confirm_active: bool = False,
         replace_active: bool = False,
     ) -> runs.SpeedProbeRun:
         delay_policy = _delay_policy(policy)
         legacy_quiz = _load_probe_quiz(quiz_file, question_count=question_count)
-        profile_id = account_profile_id or accounts.current_profile(
-            store_root=self.account_store_root,
-        ).id
+        normalized_profile_id = (account_profile_id or "").strip() or None
+        if normalized_profile_id is None:
+            if not confirm_active:
+                raise SpeedProbeActiveProfileError(
+                    "Speed probe would run against the active/default account "
+                    "profile and burn its limits. Select an explicit profile or "
+                    "pass confirm_active=True to probe the active one."
+                )
+            profile_id = accounts.current_profile(
+                store_root=self.account_store_root,
+            ).id
+        else:
+            profile_id = normalized_profile_id
         quiz_name = _disposable_quiz_name()
         run = self.run_store.create_speed_probe_run(
             source_quiz_file=quiz_file,
@@ -253,72 +275,77 @@ class SpeedProbeService:
         report.cleanup_status = run.cleanup_status
         self._write_report(report)
 
-        speed_snapshot = _capture_speed_settings()
-        config.apply_speed_mode("fast")
+        timing_profile = config.build_timing_profile(_PROBE_SPEED_PRESET)
         try:
-            client_cm = await _maybe_await(self.client_factory(run.account_profile_id))
-            async with client_cm as client:
-                if not report.draft_created:
-                    await self.flow.create_quiz(client, run.quiz_name)
-                    report.draft_created = True
-                    self._write_report(report)
+            async with telegram_client_factory.session_lock_for_profile(
+                run.account_profile_id,
+                store_root=self.account_store_root,
+                config_module=config,
+            ):
+                client_cm = await _maybe_await(self.client_factory(run.account_profile_id))
+                setattr(client_cm, "timing_profile", timing_profile)
+                async with client_cm as client:
+                    if not report.draft_created:
+                        await self.flow.create_quiz(client, run.quiz_name)
+                        report.draft_created = True
+                        self._write_report(report)
 
-                questions_by_source = _questions_by_source(legacy_quiz)
-                while report.next_question_index <= report.question_count:
-                    source_index = report.next_question_index
-                    question = questions_by_source.get(source_index)
-                    if question is None:
-                        raise SpeedProbeStateError(
-                            f"No probe question for source index {source_index}"
+                    questions_by_source = _questions_by_source(legacy_quiz)
+                    while report.next_question_index <= report.question_count:
+                        source_index = report.next_question_index
+                        question = questions_by_source.get(source_index)
+                        if question is None:
+                            raise SpeedProbeStateError(
+                                f"No probe question for source index {source_index}"
+                            )
+                        started = self.monotonic()
+                        report.questions_attempted = max(
+                            report.questions_attempted,
+                            source_index,
                         )
-                    started = self.monotonic()
-                    report.questions_attempted = max(
-                        report.questions_attempted,
-                        source_index,
-                    )
-                    self._write_report(report)
-                    try:
-                        await self.flow.upload_question(
-                            client,
-                            question,
-                            index_in_quiz=report.questions_confirmed + 1,
-                            send_prelude=True,
-                            shuffle_options=False,
-                        )
-                    except (Exception, KeyboardInterrupt, asyncio.CancelledError) as exc:
+                        self._write_report(report)
+                        try:
+                            await self.flow.upload_question(
+                                client,
+                                question,
+                                index_in_quiz=report.questions_confirmed + 1,
+                                send_prelude=True,
+                                shuffle_options=False,
+                            )
+                        except (Exception, KeyboardInterrupt, asyncio.CancelledError) as exc:
+                            duration = self.monotonic() - started
+                            return self._record_probe_error(
+                                run_id,
+                                report,
+                                exc,
+                                source_question_index=source_index,
+                                duration_seconds=duration,
+                            )
+
                         duration = self.monotonic() - started
-                        return self._record_probe_error(
-                            run_id,
-                            report,
-                            exc,
-                            source_question_index=source_index,
-                            duration_seconds=duration,
+                        report.questions_confirmed += 1
+                        report.next_question_index = source_index + 1
+                        report.question_timings.append(
+                            _timing_event(
+                                source_question_index=source_index,
+                                status="confirmed",
+                                duration_seconds=duration,
+                            )
                         )
+                        self._write_report(report)
 
-                    duration = self.monotonic() - started
-                    report.questions_confirmed += 1
-                    report.next_question_index = source_index + 1
-                    report.question_timings.append(
-                        _timing_event(
-                            source_question_index=source_index,
-                            status="confirmed",
-                            duration_seconds=duration,
-                        )
-                    )
+                    share_link = await self.flow.finish_quiz(client)
+                    run = self._load_probe_run(run_id)
+                    run.status = "completed"
+                    run.cleanup_status = "manual_required"
+                    run.last_error = None
+                    saved = self.run_store.save_run(run)
+                    report.status = saved.status
+                    report.cleanup_status = saved.cleanup_status
+                    report.share_link = share_link
+                    report.last_error = None
                     self._write_report(report)
-
-                share_link = await self.flow.finish_quiz(client)
-                run = self._load_probe_run(run_id)
-                run.status = "completed"
-                run.cleanup_status = "manual_required"
-                run.last_error = None
-                saved = self.run_store.save_run(run)
-                report.status = saved.status
-                report.cleanup_status = saved.cleanup_status
-                report.share_link = share_link
-                report.last_error = None
-                self._write_report(report)
-                return saved
+                    return saved
         except (Exception, KeyboardInterrupt, asyncio.CancelledError) as exc:
             report = self.load_report(run_id)
             source_index = min(
@@ -332,8 +359,6 @@ class SpeedProbeService:
                 source_question_index=source_index,
                 duration_seconds=0.0,
             )
-        finally:
-            _restore_speed_settings(speed_snapshot)
 
     def _record_probe_error(
         self,
@@ -517,20 +542,6 @@ def _recommendation_placeholder() -> dict[str, Any]:
         "long_pause_every": None,
         "long_pause_duration": None,
     }
-
-
-def _capture_speed_settings() -> dict[str, Any]:
-    return {
-        "DELAY_BETWEEN_MESSAGES": config.DELAY_BETWEEN_MESSAGES,
-        "DELAY_BETWEEN_QUESTIONS": config.DELAY_BETWEEN_QUESTIONS,
-        "LONG_PAUSE_EVERY_N_QUESTIONS": config.LONG_PAUSE_EVERY_N_QUESTIONS,
-        "LONG_PAUSE_DURATION": config.LONG_PAUSE_DURATION,
-    }
-
-
-def _restore_speed_settings(snapshot: Mapping[str, Any]) -> None:
-    for name, value in snapshot.items():
-        setattr(config, name, value)
 
 
 async def _maybe_await(value: Any) -> Any:

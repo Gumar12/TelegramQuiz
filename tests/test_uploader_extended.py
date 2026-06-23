@@ -199,6 +199,53 @@ def test_upload_question_can_shuffle_options_and_preserve_correct_answer(monkeyp
     assert [options[index] for index in correct_indexes] == ["Эмир Тимур"]
 
 
+def test_poll_options_shuffle_keeps_correct_with_duplicate_option_texts():
+    from types import SimpleNamespace
+
+    # Two options share the exact same text but only the second one is correct.
+    # A text-based .index() mapping after shuffle would lock onto the first
+    # match and corrupt which option is correct; the flag-carrying shuffle must
+    # not.
+    question = SimpleNamespace(
+        question="Который из них верный дубликат?",
+        options=["Тимур", "Дубликат", "Дубликат", "Абылай"],
+        correct=3,
+    )
+
+    for seed in range(20):
+        options, correct_indexes = flow._poll_options(
+            question,
+            index_in_quiz=1,
+            shuffle_options=True,
+            shuffle_seed=seed,
+        )
+        assert sorted(options) == sorted(question.options)
+        assert len(correct_indexes) == 1
+        # The originally-correct option is the SECOND "Дубликат"; exactly one
+        # option must be flagged correct and it must be a "Дубликат".
+        assert options[correct_indexes[0]] == "Дубликат"
+
+
+def test_poll_options_without_shuffle_returns_zero_based_correct():
+    from types import SimpleNamespace
+
+    question = SimpleNamespace(
+        question="Без перемешивания",
+        options=["A", "B", "C", "D"],
+        correct=[2, 4],
+    )
+
+    options, correct_indexes = flow._poll_options(
+        question,
+        index_in_quiz=1,
+        shuffle_options=False,
+        shuffle_seed=7,
+    )
+
+    assert options == ["A", "B", "C", "D"]
+    assert correct_indexes == [1, 3]
+
+
 def test_upload_question_can_shuffle_options_and_preserve_multiple_correct_answers(monkeypatch):
     class FakeMessage:
         def __init__(self, text, buttons=None):

@@ -169,15 +169,29 @@ def probe_speed(args: argparse.Namespace) -> int:
     if replace_active is None:
         return 1
 
-    run = _run_maybe_async(
-        service.start_probe(
-            quiz_file=quiz_path,
-            question_count=args.questions,
-            policy=args.policy,
-            account_profile_id=args.profile,
-            replace_active=replace_active,
+    normalized_profile = (args.profile or "").strip() or None
+    if normalized_profile is None and not args.confirm_active:
+        print(
+            "Speed probe заблокирован: без --profile он запустился бы на активном "
+            "(боевом) account profile и сжёг бы его лимиты.",
+            file=sys.stderr,
         )
-    )
+        print(
+            "Укажи конкретный профиль через --profile <id>, либо явно подтверди "
+            "запуск на активном профиле через --confirm-active."
+        )
+        return 1
+
+    probe_kwargs: dict[str, Any] = {
+        "quiz_file": quiz_path,
+        "question_count": args.questions,
+        "policy": args.policy,
+        "account_profile_id": normalized_profile,
+        "replace_active": replace_active,
+    }
+    if normalized_profile is None:
+        probe_kwargs["confirm_active"] = True
+    run = _run_maybe_async(service.start_probe(**probe_kwargs))
 
     _print_run_summary(run, title="Speed probe завершен или поставлен на паузу.")
     report_path = service.report_path(run.probe_id)
@@ -933,6 +947,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Probe delay policy",
     )
     probe.add_argument("--profile", default=None, help="Account profile override")
+    probe.add_argument(
+        "--confirm-active",
+        action="store_true",
+        help=(
+            "Explicitly allow probing the active/default account profile when "
+            "no --profile is given (the probe will burn its limits)."
+        ),
+    )
     probe.add_argument(
         "--yes",
         action="store_true",

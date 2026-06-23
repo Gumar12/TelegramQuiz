@@ -5,16 +5,45 @@ import re
 from pathlib import Path
 
 import pytest
+from telethon.errors import FloodWaitError
 
-from backend import config, runs
+from backend import accounts, config, quizbot_client, runs
 from backend.pipeline.review import build_review_artifact
 from backend.pipeline.validation import validate_clean_quiz_file
+from backend.quizbot_client import FloodWaitCapExceeded, QuizBotClient
 from backend.upload_service import (
     UNDO_COMMAND,
     UploadConfirmationRequired,
     UploadGateBlockedError,
     UploadService,
 )
+
+
+def _flood_wait(seconds: int) -> FloodWaitError:
+    error = FloodWaitError(request=None)
+    error.seconds = seconds
+    return error
+
+
+class _FloodThenOkConversation:
+    """Бросает FloodWait заданное число раз, затем отвечает успехом."""
+
+    def __init__(self, floods: list[FloodWaitError]):
+        self._floods = list(floods)
+        self.calls = 0
+
+    async def send_message(self, text: str):
+        self.calls += 1
+        if self._floods:
+            raise self._floods.pop(0)
+        return object()
+
+
+def _client_with_conversation(conversation) -> QuizBotClient:
+    client = QuizBotClient.__new__(QuizBotClient)
+    client._conv = conversation
+    client.timing_profile = None
+    return client
 
 
 def _question(index: int) -> dict:
@@ -84,6 +113,43 @@ class FakeClientFactory:
         return client
 
 
+class OrderedClient:
+    def __init__(
+        self,
+        *,
+        label: str,
+        entered: list[str],
+        block_enter: asyncio.Event | None = None,
+    ):
+        self.profile_id = "default"
+        self.label = label
+        self.entered = entered
+        self.block_enter = block_enter
+        self.sent_text: list[str] = []
+
+    async def __aenter__(self):
+        self.entered.append(self.label)
+        if self.block_enter is not None:
+            await self.block_enter.wait()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def send_text(self, text: str):
+        self.sent_text.append(text)
+
+
+class OrderedClientFactory:
+    def __init__(self, clients: list[OrderedClient]):
+        self.clients = clients
+        self.profile_ids: list[str] = []
+
+    def __call__(self, profile_id: str) -> OrderedClient:
+        self.profile_ids.append(profile_id)
+        return self.clients.pop(0)
+
+
 class FakeFlow:
     def __init__(self, failures: dict[int, BaseException] | None = None):
         self.failures = failures or {}
@@ -106,7 +172,7 @@ class FakeFlow:
         shuffle_seed: int = 42,
     ) -> None:
         source_index = _source_index(q.question)
-        self.speed_snapshots.append(config.DELAY_BETWEEN_QUESTIONS)
+        self.speed_snapshots.append(_client_delay_between_questions(client))
         failure = self.failures.get(source_index)
         if failure is not None:
             raise failure
@@ -130,17 +196,39 @@ def _source_index(text: str) -> int:
     return int(match.group(1))
 
 
-def _service(tmp_path: Path, flow: FakeFlow, *, checkpoints: list[dict] | None = None):
-    factory = FakeClientFactory()
+def _client_delay_between_questions(client) -> tuple[float, float]:
+    profile = getattr(client, "timing_profile", None)
+    if profile is not None:
+        return profile.delay_between_questions
+    return config.DELAY_BETWEEN_QUESTIONS
+
+
+def _service(
+    tmp_path: Path,
+    flow: FakeFlow,
+    *,
+    checkpoints: list[dict] | None = None,
+    client_factory: FakeClientFactory | OrderedClientFactory | None = None,
+):
+    factory = client_factory or FakeClientFactory()
     store = runs.RunStore(tmp_path / "runtime")
     callback = None
     if checkpoints is not None:
         callback = lambda run: checkpoints.append(run.to_dict())
+    account_store = tmp_path / "accounts"
+    accounts.create_profile(
+        display_name="default",
+        api_id=12345,
+        api_hash="api-hash",
+        phone="+70000000000",
+        store_root=account_store,
+    )
     service = UploadService(
         run_store=store,
         client_factory=factory,
         flow_primitives=flow,
         checkpoint_callback=callback,
+        account_store_root=account_store,
     )
     return service, store, factory
 
@@ -446,6 +534,56 @@ def test_continue_from_after_next_requires_skip_confirmation_and_writes_events(t
     assert [item["source"] for item in flow.uploaded] == [4, 5]
 
 
+def test_concurrent_upload_runs_for_same_profile_use_session_lock(tmp_path):
+    async def run_scenario():
+        quiz_path = _quiz_file(tmp_path, 2)
+        review_path = _review_file(tmp_path, quiz_path)
+        flow = FakeFlow()
+        entered: list[str] = []
+        first_release = asyncio.Event()
+        first_client = OrderedClient(
+            label="first",
+            entered=entered,
+            block_enter=first_release,
+        )
+        second_client = OrderedClient(label="second", entered=entered)
+        service, store, _factory = _service(
+            tmp_path,
+            flow,
+            client_factory=OrderedClientFactory([first_client, second_client]),
+        )
+
+        first_task = asyncio.create_task(
+            service.start_upload(
+                quiz_file=quiz_path,
+                review_artifact_file=review_path,
+                account_profile_id="default",
+            )
+        )
+        while len(entered) < 1:
+            await asyncio.sleep(0.01)
+
+        second_task = asyncio.create_task(
+            service.start_upload(
+                quiz_file=quiz_path,
+                review_artifact_file=review_path,
+                account_profile_id="default",
+                replace_active=True,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert entered == ["first"]
+        first_release.set()
+
+        first = await first_task
+        second = await second_task
+        assert entered == ["first", "second"]
+        assert first.status == "completed"
+        assert second.status == "completed"
+
+    asyncio.run(run_scenario())
+
+
 def test_quiz_hash_mismatch_blocks_resume(tmp_path):
     quiz_path = _quiz_file(tmp_path, 2)
     review_path = _review_file(tmp_path, quiz_path)
@@ -474,3 +612,73 @@ def test_upload_is_blocked_without_fresh_review_artifact(tmp_path):
 
     assert factory.clients == []
     assert flow.uploaded == []
+
+
+def test_flood_wait_below_cap_sleeps_with_jitter_then_retries(monkeypatch):
+    monkeypatch.setattr(config, "FLOOD_WAIT_MAX_SECONDS", 300.0)
+    monkeypatch.setattr(config, "rand_delay", lambda rng: 1.5)
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(quizbot_client.asyncio, "sleep", fake_sleep)
+    conversation = _FloodThenOkConversation([_flood_wait(30)])
+    client = _client_with_conversation(conversation)
+
+    result = asyncio.run(client.send_text("hello"))
+
+    assert result is not None
+    assert conversation.calls == 2  # один flood + один успех
+    # Bounded sleep с джиттером: первый — межсообщенческая задержка, второй —
+    # e.seconds (30) + джиттер (1.5).
+    assert slept[-1] == pytest.approx(31.5)
+    assert max(slept) < config.FLOOD_WAIT_MAX_SECONDS
+
+
+def test_flood_wait_above_cap_raises_controlled_pause_without_long_sleep(monkeypatch):
+    monkeypatch.setattr(config, "FLOOD_WAIT_MAX_SECONDS", 300.0)
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(quizbot_client.asyncio, "sleep", fake_sleep)
+    conversation = _FloodThenOkConversation([_flood_wait(7200)])
+    client = _client_with_conversation(conversation)
+
+    with pytest.raises(FloodWaitCapExceeded) as exc_info:
+        asyncio.run(client.send_text("hello"))
+
+    # Не делаем многочасовой сон — поднимаем контролируемую паузу сразу.
+    assert all(s < config.FLOOD_WAIT_MAX_SECONDS for s in slept)
+    assert conversation.calls == 1
+    assert exc_info.value.retry_after == 7200
+    assert exc_info.value.cooldown_seconds == 7200
+    assert exc_info.value.seconds == 7200
+
+
+def test_flood_wait_cap_pauses_run_with_retry_after_and_cooldown(tmp_path):
+    quiz_path = _quiz_file(tmp_path, 3)
+    review_path = _review_file(tmp_path, quiz_path)
+    flow = FakeFlow(failures={2: FloodWaitCapExceeded(7200, 300.0, context="poll")})
+    service, store, _factory = _service(tmp_path, flow)
+
+    run = asyncio.run(
+        service.start_upload(
+            quiz_file=quiz_path,
+            review_artifact_file=review_path,
+            account_profile_id="default",
+        )
+    )
+
+    persisted = store.load_run(run.run_id)
+    assert persisted.status == "paused"
+    assert persisted.next_question_index == 2
+    assert persisted.uploaded_questions == [1]
+    assert persisted.last_error["code"] == "telegram_flood_wait"
+    assert persisted.last_error["retry_after_seconds"] == 7200
+    cooldown = persisted.cooldown_events[-1]
+    assert cooldown["reason"] == "telegram_flood_wait_cap"
+    assert cooldown["retry_after_seconds"] == 7200
+    assert cooldown["source_question_index"] == 2

@@ -196,6 +196,7 @@ def request_markup(
     except urllib.error.URLError as exc:
         raise DeepSeekMarkupError(f"DeepSeek request failed: {exc.reason}") from exc
 
+    _check_finish_reason(raw)
     content = _message_content(raw)
     try:
         markup = json.loads(content)
@@ -230,12 +231,37 @@ def _post_chat_completion(
         return json.loads(response.read().decode("utf-8"))
 
 
-def _message_content(raw: dict[str, Any]) -> str:
+def _first_choice(raw: dict[str, Any]) -> dict[str, Any]:
     try:
-        content = raw["choices"][0]["message"]["content"]
+        choice = raw["choices"][0]
     except (KeyError, IndexError, TypeError) as exc:
-        raise DeepSeekMarkupError("DeepSeek response does not contain choices[0].message.content") from exc
+        raise DeepSeekMarkupError("DeepSeek response does not contain choices[0]") from exc
+    if not isinstance(choice, dict):
+        raise DeepSeekMarkupError("DeepSeek response choices[0] is not an object")
+    return choice
+
+
+def _check_finish_reason(raw: dict[str, Any]) -> None:
+    """Fail loudly on truncated/incomplete generations instead of parsing junk."""
+
+    finish_reason = _first_choice(raw).get("finish_reason")
+    if finish_reason in ("length", "content_filter"):
+        raise DeepSeekMarkupError(
+            "DeepSeek response was truncated "
+            f"(finish_reason={finish_reason}); increase max_tokens or shorten the document"
+        )
+
+
+def _message_content(raw: dict[str, Any]) -> str:
+    message = _first_choice(raw).get("message")
+    if not isinstance(message, dict):
+        raise DeepSeekMarkupError("DeepSeek response does not contain choices[0].message")
+    content = message.get("content")
     if not isinstance(content, str) or not content.strip():
+        # ``reasoning_content`` is the model's private chain-of-thought, not the
+        # contracted JSON answer. Empty ``content`` means the provider/model did
+        # not produce a usable response; treat it as a recoverable error rather
+        # than trusting reasoning_content as final JSON.
         raise DeepSeekMarkupError("DeepSeek returned empty message content")
     return content.strip()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import mimetypes
 import os
 import random
@@ -17,6 +18,14 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 from pydantic import ValidationError
+
+log = logging.getLogger(__name__)
+
+# Upper bound on the image payload we are willing to send to the model. When the
+# ffmpeg resize fails we fall back to the original bytes — but an oversize
+# original must be blocked/flagged, not sent blindly. ~20 MB matches the
+# practical image-input ceiling for the responses API.
+MAX_IMAGE_PAYLOAD_BYTES = 20 * 1024 * 1024
 
 from backend import config
 from backend.normalizer_io import (
@@ -114,6 +123,27 @@ def _mime_type_for(path: Path) -> str:
     return "image/jpeg"
 
 
+class OversizeMediaError(ValueError):
+    """Raised when an image payload exceeds the configured send limit."""
+
+
+def _data_url_from_original(path: Path, *, reason: str) -> str:
+    """Emit the original image bytes, blocking payloads above the size limit."""
+    data = path.read_bytes()
+    if len(data) > MAX_IMAGE_PAYLOAD_BYTES:
+        log.warning(
+            "Image %s blocked: %s but %d bytes exceeds limit %d; not sending",
+            path,
+            reason,
+            len(data),
+            MAX_IMAGE_PAYLOAD_BYTES,
+        )
+        raise OversizeMediaError(
+            f"image payload {len(data)} bytes exceeds limit {MAX_IMAGE_PAYLOAD_BYTES}"
+        )
+    return _data_url_from_bytes(data, _mime_type_for(path))
+
+
 def prepare_image_data_url(
     image_path: str | Path,
     *,
@@ -128,7 +158,7 @@ def prepare_image_data_url(
     size = _probe_image_size(path, _ffprobe_for(ffmpeg_path), timeout=20)
     should_resize = bool(size and max(size) > max_side)
     if not should_resize:
-        return _data_url_from_bytes(path.read_bytes(), _mime_type_for(path))
+        return _data_url_from_original(path, reason="resize not required")
 
     with tempfile.TemporaryDirectory(prefix="quizbot_media_") as tmpdir:
         output_path = Path(tmpdir) / "image.jpg"
@@ -155,7 +185,8 @@ def prepare_image_data_url(
                 timeout=60,
             )
         except (OSError, subprocess.SubprocessError):
-            return _data_url_from_bytes(path.read_bytes(), _mime_type_for(path))
+            log.warning("ffmpeg resize failed for %s; falling back to original bytes", path)
+            return _data_url_from_original(path, reason="ffmpeg resize fallback")
         return _data_url_from_bytes(output_path.read_bytes(), "image/jpeg")
 
 
@@ -183,6 +214,10 @@ def prepare_media_inputs(
                     max_side=max_side,
                     jpeg_quality=jpeg_quality,
                 )
+        except OversizeMediaError:
+            # Oversize payload was blocked (already logged). Drop this media so
+            # the item routes to visual review instead of sending it blindly.
+            continue
         except OSError:
             continue
         media_inputs.append(
@@ -195,15 +230,47 @@ def prepare_media_inputs(
     return media_inputs
 
 
+# Suffix allowlist mirrors backend.studio_api.MEDIA_SUFFIXES — only image media
+# is ever read off disk and forwarded to the model.
+MEDIA_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _contained_media_file(candidate: Path, root: Path) -> Path | None:
+    resolved = candidate.resolve()
+    if not _is_relative_to(resolved, root.resolve()):
+        return None
+    if resolved.suffix.lower() not in MEDIA_SUFFIXES:
+        return None
+    if resolved.exists() and resolved.is_file():
+        return resolved
+    return None
+
+
 def resolve_media_path(media: str | Path, media_root: str | Path | None = None) -> Path | None:
     path = Path(media)
-    if path.exists():
-        return path
 
+    # Without a trusted root we have no boundary to enforce; only accept a media
+    # ref that already points at an existing image file with an allowed suffix.
     if media_root is None:
+        if path.exists() and path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES:
+            return path
         return None
 
     root = Path(media_root)
+    # A media ref must resolve INSIDE the trusted media root. Absolute paths
+    # outside the root and ``..`` escapes are rejected, never read.
+    direct = _contained_media_file(path, root)
+    if direct is not None:
+        return direct
+
     filename = path.name
     candidates = [
         root / filename,
@@ -214,8 +281,9 @@ def resolve_media_path(media: str | Path, media_root: str | Path | None = None) 
         candidates.append(root / media_text.rsplit("/media/", 1)[1])
 
     for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        contained = _contained_media_file(candidate, root)
+        if contained is not None:
+            return contained
     return None
 
 
@@ -513,16 +581,18 @@ def _check_cancel(cancel_check: CancelCheck | None) -> None:
 
 
 def shuffle_options(item: CleanQuestion, seed: int) -> CleanQuestion:
-    options = list(item.options)
     correct_indexes = item.correct if isinstance(item.correct, list) else [item.correct]
-    correct_answers = [item.options[index - 1] for index in correct_indexes]
-    random.Random(f"{seed}:{item.source_item_id}").shuffle(options)
-    indexed_answers = sorted(
-        (options.index(correct_answer) + 1, correct_answer)
-        for correct_answer in correct_answers
-    )
-    new_correct_indexes = [index for index, _ in indexed_answers]
-    new_correct_answers = [answer for _, answer in indexed_answers]
+    correct_set = set(correct_indexes)
+    # Carry correctness as a per-option flag through the permutation so that
+    # duplicate option texts can never shift which option is correct.
+    paired = [
+        (option, (position + 1) in correct_set)
+        for position, option in enumerate(item.options)
+    ]
+    random.Random(f"{seed}:{item.source_item_id}").shuffle(paired)
+    options = [option for option, _ in paired]
+    new_correct_indexes = [index for index, (_, is_correct) in enumerate(paired, start=1) if is_correct]
+    new_correct_answers = [options[index - 1] for index in new_correct_indexes]
     correct: int | list[int] = (
         new_correct_indexes[0] if len(new_correct_indexes) == 1 else new_correct_indexes
     )
@@ -840,6 +910,8 @@ def main() -> None:
 
 __all__ = [
     "NormalizeOne",
+    "OversizeMediaError",
+    "MAX_IMAGE_PAYLOAD_BYTES",
     "SYSTEM_PROMPT",
     "build_messages",
     "build_response_schema",

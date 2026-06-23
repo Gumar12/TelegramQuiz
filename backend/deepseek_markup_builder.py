@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 
+# Suffix allowlist mirrors backend.studio_api.MEDIA_SUFFIXES — media is only
+# ever copied/served when its extension is one of these image types.
+MEDIA_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+
 BLOCK_HEADER_RE = re.compile(r"^\[BLOCK\s+(?P<id>[^\s|]+)\s*\|(?P<meta>.*)\]\s*$")
 IMAGE_HEADER_RE = re.compile(r"^\[IMAGE\s+(?P<id>[^\s|]+)\s*\|(?P<meta>.*)\]\s*$")
 OPTION_PREFIX_RE = re.compile(r"^\s*([A-ZА-Я])[\).]\s*(.+)$", re.I)
@@ -191,6 +195,28 @@ def _resolve_existing_id(source: SourceBlocks, block_id: str) -> str | None:
     return None
 
 
+def _validate_known_ids(source: SourceBlocks, raw_ids: Any) -> tuple[list[str], list[str]]:
+    """Split LLM-supplied ids into ones present in the known extracted set and unknowns.
+
+    The known ids are exactly the block/image ids parsed from the DOCX stream
+    (``source.blocks`` / ``source.images``). LLM-named ids are advisory: an id is
+    accepted only if it resolves to a real extracted id (allowlist by id), never
+    because the model named it. Malformed (non-list) input yields no known ids.
+    """
+
+    if not isinstance(raw_ids, list):
+        return [], []
+    known: list[str] = []
+    unknown: list[str] = []
+    for raw_id in raw_ids:
+        block_id = str(raw_id)
+        if _resolve_existing_id(source, block_id) is not None:
+            known.append(block_id)
+        else:
+            unknown.append(block_id)
+    return known, unknown
+
+
 def _block_position(source: SourceBlocks, block_id: str) -> int | None:
     resolved = _resolve_existing_id(source, block_id)
     if resolved is None:
@@ -339,19 +365,59 @@ def _existing_output_media_ref(media_ref: str, *, output_dir: Path, media_prefix
         candidates.append((output_dir / filename, f"{media_prefix}/{filename}"))
 
     for candidate, ref in candidates:
-        try:
-            candidate.resolve().relative_to(output_dir.resolve())
-        except ValueError:
+        resolved = candidate.resolve()
+        if not _is_relative_to(resolved, output_dir.resolve()):
             continue
-        if candidate.exists():
+        if resolved.suffix.lower() not in MEDIA_SUFFIXES:
+            continue
+        if resolved.exists() and resolved.is_file():
             return ref
     return None
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _trusted_media_roots(output_dir: Path) -> list[Path]:
+    """Server-owned roots a media source is allowed to resolve inside.
+
+    A media ref is only honoured when it lands in the media output dir or its
+    parent workspace (where the DOCX media was extracted). Anything else — an
+    absolute system path or a ``..`` escape — is rejected.
+    """
+
+    roots = [output_dir.resolve()]
+    parent = output_dir.parent.resolve()
+    if parent not in roots:
+        roots.append(parent)
+    return roots
+
+
+def _contained_existing_file(candidate: Path, roots: list[Path]) -> Path | None:
+    resolved = candidate.resolve()
+    if not any(_is_relative_to(resolved, root) for root in roots):
+        return None
+    if resolved.suffix.lower() not in MEDIA_SUFFIXES:
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    return resolved
 
 
 def _first_existing_media_source(media_ref: str, *, output_dir: Path, media_prefix: str) -> Path | None:
     raw_path = Path(media_ref)
     normalized = str(media_ref).replace("\\", "/").lstrip("/")
-    candidates = [raw_path]
+    roots = _trusted_media_roots(output_dir)
+    candidates: list[Path] = []
+    # An absolute media ref is honoured only if it already points inside a
+    # trusted root; otherwise it is a path-traversal / arbitrary-read attempt.
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
     if normalized.startswith(f"{media_prefix}/"):
         candidates.append(output_dir / normalized.split("/", 1)[1])
     if raw_path.name:
@@ -360,8 +426,9 @@ def _first_existing_media_source(media_ref: str, *, output_dir: Path, media_pref
         candidates.append(output_dir.parent / raw_path)
 
     for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        contained = _contained_existing_file(candidate, roots)
+        if contained is not None:
+            return contained
     return None
 
 
@@ -432,7 +499,10 @@ def build_quiz_from_markup(
         options = [_strip_option_label(text) for text in option_texts]
 
         option_ids = item.get("option_block_ids", [])
-        correct_ids = {str(value) for value in item.get("correct_option_block_ids", []) if value}
+        known_correct_ids, unknown_correct_ids = _validate_known_ids(
+            source, item.get("correct_option_block_ids")
+        )
+        correct_ids = set(known_correct_ids)
         correct_values = [
             option_index
             for option_index, option_id in enumerate(option_ids if isinstance(option_ids, list) else [], start=1)
@@ -453,7 +523,14 @@ def build_quiz_from_markup(
             copy_cache=media_copy_cache,
         )
 
-        missing = missing_question_blocks + missing_option_blocks + missing_context_blocks + list(region.get("missing_blocks", [])) + missing_media
+        missing = (
+            missing_question_blocks
+            + missing_option_blocks
+            + missing_context_blocks
+            + list(region.get("missing_blocks", []))
+            + missing_media
+            + unknown_correct_ids
+        )
         if missing:
             quality_flags.append("missing_source_blocks: " + ", ".join(dict.fromkeys(missing)))
         if inferred_question_ids:

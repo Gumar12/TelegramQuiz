@@ -84,6 +84,12 @@ export interface JobSnapshot {
   cancel_requested: boolean;
 }
 
+export interface WaitForJobOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  pollMs?: number;
+}
+
 export interface JobEvent {
   index: number;
   job_id: string;

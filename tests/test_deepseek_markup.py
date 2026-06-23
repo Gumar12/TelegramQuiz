@@ -1,11 +1,41 @@
 import json
 from pathlib import Path
 
+import pytest
 from docx import Document
 
 from backend import deepseek_markup
 from backend import studio_api
 from backend.studio_jobs import JobManager
+
+
+def _patch_raw_response(monkeypatch, raw_response: dict) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(raw_response).encode("utf-8")
+
+    monkeypatch.setattr(
+        deepseek_markup.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+
+def _request_markup():
+    return deepseek_markup.request_markup(
+        "# DOCX_BLOCK_STREAM\n",
+        api_key="token",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        timeout_seconds=1,
+        max_tokens=1000,
+    )
 
 
 def test_blocks_markdown_from_docx_marks_options_and_bold(tmp_path: Path):
@@ -77,6 +107,45 @@ def test_request_markup_parses_deepseek_json_content(monkeypatch):
     assert raw["model"] == "deepseek-v4-flash"
     assert markup["document_id"] == "source"
     assert markup["questions"][0]["question_block_ids"] == ["p-0001"]
+
+
+def test_request_markup_rejects_truncated_finish_reason_length(monkeypatch):
+    raw_response = {
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {"content": '{"document_id": "source", "questions": ['},
+            }
+        ],
+    }
+    _patch_raw_response(monkeypatch, raw_response)
+
+    with pytest.raises(deepseek_markup.DeepSeekMarkupError) as excinfo:
+        _request_markup()
+    assert "truncated" in str(excinfo.value)
+    assert "finish_reason=length" in str(excinfo.value)
+
+
+def test_request_markup_rejects_empty_content_without_trusting_reasoning(monkeypatch):
+    raw_response = {
+        "model": "deepseek-v4-flash",
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "content": "",
+                    # reasoning_content must NOT be used as the final JSON answer.
+                    "reasoning_content": '{"document_id": "source", "questions": []}',
+                },
+            }
+        ],
+    }
+    _patch_raw_response(monkeypatch, raw_response)
+
+    with pytest.raises(deepseek_markup.DeepSeekMarkupError) as excinfo:
+        _request_markup()
+    assert "empty message content" in str(excinfo.value)
 
 
 def test_create_from_docx_ai_job_builds_final_quiz(tmp_path: Path, monkeypatch):

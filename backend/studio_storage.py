@@ -2,14 +2,40 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from backend import config
 
 DEFAULT_QUIZZES_DIR = config.DATA_DIR / "quizzes"
+
+# A group id maps directly to a `<id>.json` filename, so it must never carry
+# any path separators or directory traversal. Allow only a safe character set.
+_GROUP_ID_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._ -]+$", flags=re.U)
+
+
+def validate_group_id(group_id: str) -> str:
+    """Validate a group id before it is used to build a filesystem path.
+
+    Rejects empty values, `.`/`..`, and any slash/backslash so imported or
+    user-supplied ids can never escape the quizzes directory.
+    """
+    if not isinstance(group_id, str):
+        raise ValueError("group_id must be a string")
+    candidate = group_id.strip()
+    if not candidate:
+        raise ValueError("group_id must not be empty")
+    if candidate in {".", ".."}:
+        raise ValueError("group_id must not be '.' or '..'")
+    if "/" in candidate or "\\" in candidate or "\x00" in candidate:
+        raise ValueError("group_id must not contain path separators")
+    if not _GROUP_ID_RE.fullmatch(candidate):
+        raise ValueError("group_id contains invalid characters")
+    return candidate
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -21,10 +47,37 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    # Atomic write: stage to a temp file in the same dir, fsync, then
+    # os.replace so a crash mid-write can never leave a truncated quiz file.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
     )
+    tmp_path = Path(tmp_name)
+    try:
+        # mkstemp creates the temp file with mode 0600; restore the umask-based
+        # mode a plain create would have produced so quiz files stay readable.
+        if os.name == "posix":
+            umask = os.umask(0)
+            os.umask(umask)
+            try:
+                os.chmod(tmp_path, 0o666 & ~umask)
+            except OSError:
+                pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def group_id_from_path(path: str | Path) -> str:
@@ -32,7 +85,7 @@ def group_id_from_path(path: str | Path) -> str:
 
 
 def _group_path(group_id: str, quizzes_dir: str | Path = DEFAULT_QUIZZES_DIR) -> Path:
-    safe_id = Path(group_id).name
+    safe_id = validate_group_id(group_id)
     return Path(quizzes_dir) / f"{safe_id}.json"
 
 
@@ -88,10 +141,14 @@ def _to_zero_based_correct(correct: Any) -> int:
     return -1
 
 
-def _to_one_based_correct(correct: Any) -> int:
-    if isinstance(correct, int):
+def _to_one_based_correct(correct: Any) -> int | None:
+    # Preserve a missing/invalid correct answer as None instead of silently
+    # defaulting to the first option; the upload gate must keep blocking it.
+    if isinstance(correct, bool):
+        return None
+    if isinstance(correct, int) and correct >= 0:
         return correct + 1
-    return 1
+    return None
 
 
 def _status_for_payload(payload: dict[str, Any]) -> str:
@@ -136,7 +193,9 @@ def load_group(group_id: str, quizzes_dir: str | Path = DEFAULT_QUIZZES_DIR) -> 
     for index, item in enumerate(raw_questions):
         if not isinstance(item, dict):
             continue
-        correct = item.get("correct", 1)
+        # Keep a missing correct answer missing (-> -1 / invalid) instead of
+        # defaulting to the first option.
+        correct = item.get("correct")
         questions.append(
             {
                 "id": _ui_question_id(item, index),
@@ -181,7 +240,7 @@ def _backend_question(item: dict[str, Any]) -> dict[str, Any]:
     output: dict[str, Any] = {
         "question": item.get("question", ""),
         "options": list(item.get("options", [])),
-        "correct": _to_one_based_correct(item.get("correct", 0)),
+        "correct": _to_one_based_correct(item.get("correct")),
         "explanation": item.get("explanation", ""),
         "context_title": item.get("context_title", ""),
         "context": item.get("context", ""),
@@ -209,15 +268,17 @@ def _clean_option_text(option: Any) -> str:
     return str(option).strip()
 
 
-def _clean_answers_to_correct(answers: Any) -> int | list[int]:
+def _clean_answers_to_correct(answers: Any) -> int | list[int] | None:
     if isinstance(answers, list):
-        correct_values = [item for item in answers if isinstance(item, int)]
+        correct_values = [item for item in answers if isinstance(item, int) and not isinstance(item, bool)]
         if len(correct_values) == 1:
             return correct_values[0]
-        return correct_values
-    if isinstance(answers, int):
+        # Preserve a missing/invalid answer as None instead of defaulting to
+        # the first option; the upload gate must keep blocking it.
+        return correct_values or None
+    if isinstance(answers, int) and not isinstance(answers, bool):
         return answers
-    return 1
+    return None
 
 
 def _payload_from_clean_quiz(payload: dict[str, Any], title: str, description: str) -> dict[str, Any]:
@@ -379,7 +440,7 @@ def _payload_from_block_markup(payload: dict[str, Any], title: str, description:
                 "source_item_id": question_id,
                 "question": question_text,
                 "options": options,
-                "correct": correct_values[0] if len(correct_values) == 1 else correct_values or 1,
+                "correct": correct_values[0] if len(correct_values) == 1 else correct_values or None,
                 "explanation": "",
                 "context": context_text,
                 "quality_flags": [str(flag) for flag in item.get("warnings", []) if isinstance(flag, str)],

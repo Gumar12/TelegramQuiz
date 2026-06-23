@@ -173,6 +173,106 @@ def test_probe_speed_replacement_requires_confirmation_for_protected_active_run(
     assert "Новый probe-speed не запущен" in captured.out
 
 
+def test_probe_speed_without_profile_or_confirm_is_blocked(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    quiz_path = tmp_path / "probe.clean.json"
+    _write_quiz(quiz_path)
+    service = FakeSpeedProbeService()
+    monkeypatch.setattr(pipeline_cli, "_make_speed_probe_service", lambda: service)
+
+    exit_code = pipeline_cli.run(
+        [
+            "probe-speed",
+            "--file",
+            str(quiz_path),
+            "--questions",
+            "1",
+            "--policy",
+            "fast-threshold",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    # Probe не запущен: активный профиль не тронут.
+    assert service.start_calls == []
+    assert "активном" in captured.err
+    assert "--confirm-active" in captured.out
+
+
+def test_probe_speed_blank_profile_without_confirm_is_blocked(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    quiz_path = tmp_path / "probe.clean.json"
+    _write_quiz(quiz_path)
+    service = FakeSpeedProbeService()
+    monkeypatch.setattr(pipeline_cli, "_make_speed_probe_service", lambda: service)
+
+    exit_code = pipeline_cli.run(
+        [
+            "probe-speed",
+            "--file",
+            str(quiz_path),
+            "--questions",
+            "1",
+            "--policy",
+            "fast-threshold",
+            "--profile",
+            "   ",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    # Пустой/пробельный --profile не открывает доступ к активному профилю.
+    assert service.start_calls == []
+    assert "активном" in captured.err
+    assert "--confirm-active" in captured.out
+
+
+def test_probe_speed_with_confirm_active_passes_flag_to_service(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    quiz_path = tmp_path / "probe.clean.json"
+    _write_quiz(quiz_path)
+    service = FakeSpeedProbeService()
+    monkeypatch.setattr(pipeline_cli, "_make_speed_probe_service", lambda: service)
+
+    exit_code = pipeline_cli.run(
+        [
+            "probe-speed",
+            "--file",
+            str(quiz_path),
+            "--questions",
+            "1",
+            "--policy",
+            "fast-threshold",
+            "--confirm-active",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert service.start_calls == [
+        {
+            "quiz_file": quiz_path,
+            "question_count": 1,
+            "policy": "fast-threshold",
+            "account_profile_id": None,
+            "replace_active": False,
+            "confirm_active": True,
+        }
+    ]
+    assert "Speed probe" in captured.out
+
+
 def test_resume_active_speed_probe_uses_probe_service(monkeypatch, capsys):
     active = _probe_run(status="paused")
     store = FakeStore(active_run=active)

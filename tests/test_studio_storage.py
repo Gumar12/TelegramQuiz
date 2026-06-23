@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from backend import studio_storage
 
 
@@ -144,6 +146,155 @@ def test_save_group_converts_correct_index_to_one_based_and_preserves_metadata(t
     assert payload["questions"][0]["media"] == ["media/image.jpg"]
     assert payload["questions"][0]["needs_distractor_review"] is True
     assert payload["questions"][0]["warnings"] == ["Проверьте контекст"]
+
+
+def test_load_group_keeps_missing_correct_invalid_instead_of_first_option(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    quizzes_dir.mkdir()
+    (quizzes_dir / "sample.json").write_text(
+        json.dumps(
+            {
+                "quiz_title": "Sample",
+                "questions": [
+                    {"question": "Who?", "options": ["A", "B", "C"]},
+                    {"question": "What?", "options": ["A", "B", "C"], "correct": None},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    group = studio_storage.load_group("sample", quizzes_dir)
+
+    # Missing / null correct must NOT be coerced to the first option (0); it
+    # stays an invalid sentinel (-1) and blocks the ready status.
+    assert group["questions"][0]["correct"] == -1
+    assert group["questions"][1]["correct"] == -1
+    assert group["status"] == "review"
+
+
+def test_save_group_preserves_missing_correct_as_null(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    quizzes_dir.mkdir()
+
+    studio_storage.save_group(
+        "sample",
+        {
+            "id": "sample",
+            "name": "Sample",
+            "questions": [
+                {"id": "1", "question": "Who?", "options": ["A", "B", "C"], "correct": None},
+                {"id": "2", "question": "What?", "options": ["A", "B", "C"], "correct": -1},
+            ],
+        },
+        quizzes_dir,
+    )
+
+    payload = json.loads((quizzes_dir / "sample.json").read_text(encoding="utf-8"))
+    # Saved on-disk correct must stay null so the upload gate keeps blocking it,
+    # never silently coerced to the first option (1 in 1-based backend form).
+    assert payload["questions"][0]["correct"] is None
+    assert payload["questions"][1]["correct"] is None
+
+
+def test_import_clean_items_without_answers_keeps_correct_null(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    quizzes_dir.mkdir()
+
+    group = studio_storage.import_group_payload(
+        "clean_import",
+        {
+            "title": "Clean import",
+            "items": [
+                {
+                    "type": "question",
+                    "question": "Who?",
+                    "options": [{"text": "A"}, {"text": "B"}, {"text": "C"}],
+                    # No "answers" key at all.
+                },
+            ],
+        },
+        quizzes_dir,
+    )
+
+    # Imported question with no answers stays invalid (-1), not coerced to first.
+    assert group["questions"][0]["correct"] == -1
+    assert group["status"] == "review"
+    payload = json.loads((quizzes_dir / "clean_import.json").read_text(encoding="utf-8"))
+    assert payload["questions"][0]["correct"] is None
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "",
+        "   ",
+        ".",
+        "..",
+        "../escape",
+        "..\\escape",
+        "nested/sample",
+        "nested\\sample",
+        "with\x00null",
+    ],
+)
+def test_invalid_group_ids_are_rejected(bad_id: str):
+    with pytest.raises(ValueError):
+        studio_storage.validate_group_id(bad_id)
+
+
+def test_valid_group_id_is_accepted():
+    assert studio_storage.validate_group_id("19_мая_УТРО") == "19_мая_УТРО"
+
+
+def test_save_group_rejects_path_traversal_group_id(tmp_path: Path):
+    quizzes_dir = tmp_path / "quizzes"
+    quizzes_dir.mkdir()
+
+    with pytest.raises(ValueError):
+        studio_storage.save_group(
+            "../escape",
+            {"id": "../escape", "name": "x", "questions": []},
+            quizzes_dir,
+        )
+    # No file leaked outside the quizzes directory.
+    assert not (tmp_path / "escape.json").exists()
+
+
+def test_save_group_writes_atomically_via_temp_then_replace(tmp_path: Path, monkeypatch):
+    quizzes_dir = tmp_path / "quizzes"
+    quizzes_dir.mkdir()
+    (quizzes_dir / "sample.json").write_text(
+        json.dumps({"quiz_title": "Old", "questions": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    real_replace = studio_storage.os.replace
+    seen: dict[str, bool] = {}
+
+    def fake_replace(src, dst):
+        # At the moment of rename the destination still holds the previous
+        # content and the staged temp file already holds the new payload,
+        # proving the write was done out-of-place then atomically swapped.
+        seen["dest_intact"] = '"quiz_title": "Old"' in Path(dst).read_text(encoding="utf-8")
+        seen["src_has_new_payload"] = '"quiz_title": "New"' in Path(src).read_text(encoding="utf-8")
+        seen["src_is_temp"] = Path(src).name.startswith(".sample.json.")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(studio_storage.os, "replace", fake_replace)
+
+    studio_storage.save_group(
+        "sample",
+        {"id": "sample", "name": "New", "questions": []},
+        quizzes_dir,
+    )
+
+    assert seen == {"dest_intact": True, "src_has_new_payload": True, "src_is_temp": True}
+    payload = json.loads((quizzes_dir / "sample.json").read_text(encoding="utf-8"))
+    assert payload["quiz_title"] == "New"
+    # No stray temp files left behind.
+    assert [p.name for p in quizzes_dir.iterdir()] == ["sample.json"]
 
 
 def test_delete_group_removes_quiz_file(tmp_path: Path):

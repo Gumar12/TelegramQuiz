@@ -5,6 +5,7 @@
 import json
 import os
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -116,6 +117,21 @@ ETA_MAX_BOT_RESPONSE_SECONDS = 30.0
 # --- Timeouts / retries ---
 WAIT_REPLY_TIMEOUT = 15.0
 MAX_RETRIES_ON_FLOOD = 3
+# Любой FloodWait дольше этого порога не «спим» внутри ретрая (это могут быть
+# часы), а классифицируем в контролируемую паузу с retry-after-метаданными.
+FLOOD_WAIT_MAX_SECONDS = float(os.getenv("FLOOD_WAIT_MAX_SECONDS", "300"))
+# Доп. джиттер поверх e.seconds для FloodWait-ретраев ниже порога.
+FLOOD_WAIT_RETRY_JITTER = (1.0, 3.0)
+
+
+@dataclass(frozen=True, slots=True)
+class TimingProfile:
+    speed_mode: str
+    delay_between_messages: tuple[float, float]
+    delay_between_questions: tuple[float, float]
+    long_pause_every_n_questions: int
+    long_pause_duration: tuple[float, float]
+    flood_wait_max_seconds: float = FLOOD_WAIT_MAX_SECONDS
 
 
 def rand_delay(rng: tuple[float, float]) -> float:
@@ -135,6 +151,25 @@ def apply_speed_mode(mode: str) -> None:
     globals()["DELAY_BETWEEN_QUESTIONS"] = preset["DELAY_BETWEEN_QUESTIONS"]
     globals()["LONG_PAUSE_EVERY_N_QUESTIONS"] = preset["LONG_PAUSE_EVERY_N_QUESTIONS"]
     globals()["LONG_PAUSE_DURATION"] = preset["LONG_PAUSE_DURATION"]
+
+
+def build_timing_profile(mode: str) -> TimingProfile:
+    """Build an immutable timing profile for a single run."""
+    resolved_mode = auto_speed_preset(0) if mode == "auto" else mode
+    if resolved_mode not in SPEED_PRESETS:
+        raise ValueError(
+            f"Unknown speed mode {mode!r}. Available: {', '.join(SPEED_PRESETS)}"
+        )
+
+    preset = SPEED_PRESETS[resolved_mode]
+    return TimingProfile(
+        speed_mode=resolved_mode,
+        delay_between_messages=tuple(preset["DELAY_BETWEEN_MESSAGES"]),
+        delay_between_questions=tuple(preset["DELAY_BETWEEN_QUESTIONS"]),
+        long_pause_every_n_questions=int(preset["LONG_PAUSE_EVERY_N_QUESTIONS"]),
+        long_pause_duration=tuple(preset["LONG_PAUSE_DURATION"]),
+        flood_wait_max_seconds=float(FLOOD_WAIT_MAX_SECONDS),
+    )
 
 
 def auto_speed_preset(uploaded_questions: int) -> str:
@@ -172,17 +207,16 @@ def save_eta_settings(settings: dict[str, float], runtime_dir: str | Path | None
 
 def estimate_timing_profile(mode: str, *, runtime_dir: str | Path | None = None) -> dict[str, float | int]:
     """Build ETA timings from the same speed presets used by uploads."""
-    concrete_mode = auto_speed_preset(0) if mode == "auto" else mode
-    preset = SPEED_PRESETS.get(concrete_mode, SPEED_PRESETS["normal"])
+    profile = build_timing_profile(mode)
     eta_settings = load_eta_settings(runtime_dir)
     return {
         "seconds_per_question": (
-            _avg_delay(preset["DELAY_BETWEEN_MESSAGES"])
-            + _avg_delay(preset["DELAY_BETWEEN_QUESTIONS"])
+            _avg_delay(profile.delay_between_messages)
+            + _avg_delay(profile.delay_between_questions)
             + eta_settings["bot_response_seconds"]
         ),
-        "long_pause_every": int(preset.get("LONG_PAUSE_EVERY_N_QUESTIONS") or 0),
-        "long_pause_seconds": _avg_delay(preset["LONG_PAUSE_DURATION"]),
+        "long_pause_every": int(profile.long_pause_every_n_questions or 0),
+        "long_pause_seconds": _avg_delay(profile.long_pause_duration),
         "cooldown_every_uploaded": int(AUTO_SPEED_POLICY.get("cooldown_every_uploaded") or 0) if mode == "auto" else 0,
         "cooldown_seconds": _avg_delay(AUTO_SPEED_POLICY.get("cooldown_duration", (0.0, 0.0))) if mode == "auto" else 0.0,
         "bot_response_seconds": eta_settings["bot_response_seconds"],

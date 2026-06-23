@@ -108,6 +108,10 @@ export default function SettingsScreen({
   storageActionsEnabled = false,
 }: SettingsScreenProps) {
   const initialSettings = useMemo(() => mergeSettings(settings), [settings]);
+  // Stable snapshot of the meaningful settings values. Reset the draft only when
+  // these values actually change, not when the parent passes a new object reference
+  // (an unrelated rerender must not discard the user's in-progress edits).
+  const settingsSignature = useMemo(() => JSON.stringify(initialSettings), [initialSettings]);
   const [draft, setDraft] = useState<SettingsValues>(initialSettings);
   const canSave = Boolean(onSaveSettings);
   const canChooseWorkspace = storageActionsEnabled && Boolean(onChooseWorkspace);
@@ -115,7 +119,8 @@ export default function SettingsScreen({
 
   useEffect(() => {
     setDraft(initialSettings);
-  }, [initialSettings]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsSignature]);
 
   const updateDraft = (next: SettingsValues) => {
     setDraft(next);

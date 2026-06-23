@@ -59,6 +59,7 @@ class TelegramLoginFlow:
     profile_id: str
     phone: str
     phone_masked: str
+    session_path: str
     phone_code_hash: str
     step: str
     expires_at: datetime
@@ -119,59 +120,67 @@ class TelegramLoginManager:
         )
         if not bool(getattr(profile, "is_authorized", False)):
             _delete_session_files(Path(str(getattr(profile, "session_path", "") or "")))
+        session_path = Path(str(getattr(profile, "session_path", "") or "")).expanduser()
         client = self._create_client(profile_id)
 
-        try:
-            await self._connect(client)
-            log.info("telegram_login.connected profile=%s", profile_id)
-            if await self._is_user_authorized(client):
-                account = self._mark_authorized(profile_id, authorized=True)
-                await self._disconnect(client)
-                log.info("telegram_login.already_authorized profile=%s", profile_id)
-                return self._authorized_snapshot(account)
+        async with telegram_client_factory.session_file_lock(session_path):
+            try:
+                await self._connect(client)
+                accounts._chmod_session_files(session_path)
+                log.info("telegram_login.connected profile=%s", profile_id)
+                if await self._is_user_authorized(client):
+                    account = self._mark_authorized(profile_id, authorized=True)
+                    await self._disconnect(client)
+                    accounts._chmod_session_files(session_path)
+                    log.info("telegram_login.already_authorized profile=%s", profile_id)
+                    return self._authorized_snapshot(account)
 
-            log.info(
-                "telegram_login.send_code_request.start profile=%s phone=%s force_sms=%s",
-                profile_id,
-                _mask_phone(profile.phone),
-                force_sms,
-            )
-            sent_code = await self._send_code_request(
-                client,
-                profile.phone,
-                force_sms=force_sms,
-            )
-            log.info(
-                "telegram_login.send_code_request.ok profile=%s delivery=%s next=%s",
-                profile_id,
-                _sent_code_delivery_name(getattr(sent_code, "type", None)),
-                _sent_code_delivery_name(getattr(sent_code, "next_type", None)),
-            )
-            login_id = self.token_factory()
-            expires_at = self._now() + timedelta(seconds=self.ttl_seconds)
-            flow = TelegramLoginFlow(
-                login_id=login_id,
-                profile_id=profile_id,
-                phone=profile.phone,
-                phone_masked=_mask_phone(profile.phone),
-                phone_code_hash=str(getattr(sent_code, "phone_code_hash", "") or ""),
-                step="code_sent",
-                expires_at=expires_at,
-                client=client,
-            )
-            self._flows[login_id] = flow
-            self._profile_logins[profile_id] = login_id
-            return self._flow_snapshot(flow)
-        except Exception as exc:
-            if profile_id not in self._profile_logins:
-                await self._disconnect(client)
-            safe_error = _safe_telegram_error(exc)
-            log.warning(
-                "telegram_login.start.failed profile=%s error=%s",
-                profile_id,
-                safe_error,
-            )
-            raise TelegramLoginAuthError(safe_error) from exc
+                log.info(
+                    "telegram_login.send_code_request.start profile=%s phone=%s force_sms=%s",
+                    profile_id,
+                    _mask_phone(profile.phone),
+                    force_sms,
+                )
+                sent_code = await self._send_code_request(
+                    client,
+                    profile.phone,
+                    force_sms=force_sms,
+                )
+                log.info(
+                    "telegram_login.send_code_request.ok profile=%s delivery=%s next=%s",
+                    profile_id,
+                    _sent_code_delivery_name(getattr(sent_code, "type", None)),
+                    _sent_code_delivery_name(getattr(sent_code, "next_type", None)),
+                )
+                login_id = self.token_factory()
+                expires_at = self._now() + timedelta(seconds=self.ttl_seconds)
+                flow = TelegramLoginFlow(
+                    login_id=login_id,
+                    profile_id=profile_id,
+                    phone=profile.phone,
+                    phone_masked=_mask_phone(profile.phone),
+                    session_path=str(session_path),
+                    phone_code_hash=str(getattr(sent_code, "phone_code_hash", "") or ""),
+                    step="code_sent",
+                    expires_at=expires_at,
+                    client=client,
+                )
+                self._flows[login_id] = flow
+                self._profile_logins[profile_id] = login_id
+                return self._flow_snapshot(flow)
+            except Exception as exc:
+                if profile_id not in self._profile_logins:
+                    try:
+                        await self._disconnect(client)
+                    finally:
+                        accounts._chmod_session_files(session_path)
+                safe_error = _safe_telegram_error(exc)
+                log.warning(
+                    "telegram_login.start.failed profile=%s error=%s",
+                    profile_id,
+                    safe_error,
+                )
+                raise TelegramLoginAuthError(safe_error) from exc
 
     async def submit_code(self, login_id: str, code: str) -> dict[str, Any]:
         """Submit the Telegram login code for an active flow."""
@@ -180,22 +189,25 @@ class TelegramLoginManager:
         if flow.step != "code_sent":
             raise LoginStepError("Login code cannot be submitted for this step")
 
-        try:
-            await self._sign_in_code(flow, code)
-        except Exception as exc:
-            if _is_password_required_error(exc):
-                flow.step = "password_required"
-                return self._flow_snapshot(flow, include_phone=False)
-            if _is_expired_code_error(exc):
-                await self._discard_flow(flow)
-                raise InvalidTelegramCodeError(_expired_code_message(exc)) from exc
-            if _is_invalid_code_error(exc):
-                raise InvalidTelegramCodeError("Telegram rejected the login code") from exc
-            raise TelegramLoginAuthError(_safe_telegram_error(exc)) from exc
+        async with telegram_client_factory.session_file_lock(Path(flow.session_path)):
+            try:
+                await self._sign_in_code(flow, code)
+            except Exception as exc:
+                accounts._chmod_session_files(Path(flow.session_path).expanduser())
+                if _is_password_required_error(exc):
+                    flow.step = "password_required"
+                    return self._flow_snapshot(flow, include_phone=False)
+                if _is_expired_code_error(exc):
+                    await self._discard_flow(flow)
+                    raise InvalidTelegramCodeError(_expired_code_message(exc)) from exc
+                if _is_invalid_code_error(exc):
+                    raise InvalidTelegramCodeError("Telegram rejected the login code") from exc
+                raise TelegramLoginAuthError(_safe_telegram_error(exc)) from exc
+            accounts._chmod_session_files(Path(flow.session_path).expanduser())
 
-        if not await self._is_user_authorized(flow.client):
-            raise TelegramLoginAuthError("Telegram login did not authorize the session")
-        return await self._finish_authorized(flow)
+            if not await self._is_user_authorized(flow.client):
+                raise TelegramLoginAuthError("Telegram login did not authorize the session")
+            return await self._finish_authorized(flow)
 
     async def submit_password(self, login_id: str, password: str) -> dict[str, Any]:
         """Submit the Telegram 2FA password for an active flow."""
@@ -204,18 +216,21 @@ class TelegramLoginManager:
         if flow.step != "password_required":
             raise LoginStepError("Password can only be submitted after Telegram requires 2FA")
 
-        try:
-            await self._sign_in_password(flow, password)
-        except Exception as exc:
-            if _is_invalid_password_error(exc):
-                raise InvalidTelegramPasswordError(
-                    "Telegram rejected the 2FA password"
-                ) from exc
-            raise TelegramLoginAuthError(_safe_telegram_error(exc)) from exc
+        async with telegram_client_factory.session_file_lock(Path(flow.session_path)):
+            try:
+                await self._sign_in_password(flow, password)
+            except Exception as exc:
+                accounts._chmod_session_files(Path(flow.session_path).expanduser())
+                if _is_invalid_password_error(exc):
+                    raise InvalidTelegramPasswordError(
+                        "Telegram rejected the 2FA password"
+                    ) from exc
+                raise TelegramLoginAuthError(_safe_telegram_error(exc)) from exc
+            accounts._chmod_session_files(Path(flow.session_path).expanduser())
 
-        if not await self._is_user_authorized(flow.client):
-            raise TelegramLoginAuthError("Telegram 2FA login did not authorize the session")
-        return await self._finish_authorized(flow)
+            if not await self._is_user_authorized(flow.client):
+                raise TelegramLoginAuthError("Telegram 2FA login did not authorize the session")
+            return await self._finish_authorized(flow)
 
     async def status(self, login_id: str) -> dict[str, Any]:
         """Return a public snapshot for an active login flow."""
@@ -317,6 +332,7 @@ class TelegramLoginManager:
         if self._profile_logins.get(flow.profile_id) == flow.login_id:
             self._profile_logins.pop(flow.profile_id, None)
         await self._disconnect(flow.client)
+        accounts._chmod_session_files(Path(flow.session_path).expanduser())
 
     def _flow_snapshot(
         self,

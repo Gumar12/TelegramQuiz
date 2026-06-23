@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,11 +18,12 @@ from backend.telegram_login import (
 
 RAW_PHONE = "+77001234567"
 API_HASH = "api-hash-should-not-leak"
-SESSION_PATH = "/tmp/private/default.session"
+SESSION_PATH = f"/tmp/telegramquiz-test-{uuid.uuid4().hex}.session"
 PHONE_CODE_HASH = "phone-code-hash-should-stay-in-memory"
 SESSION_CONTENTS = "session-contents-should-not-leak"
 VALID_CODE = "24680"
 VALID_PASSWORD = "ultra-secret-password"
+POSIX_MODE_REASON = "POSIX permission bits are not reliable on Windows"
 
 
 class PasswordRequiredError(Exception):
@@ -179,6 +182,34 @@ class FakeTelegramClient:
         return SimpleNamespace(id=1)
 
 
+class SessionWritingClient(FakeTelegramClient):
+    def __init__(self, session_path: Path):
+        super().__init__()
+        self.session_path = session_path
+
+    async def sign_in(
+        self,
+        *,
+        phone: str | None = None,
+        code: str | None = None,
+        password: str | None = None,
+        phone_code_hash: str | None = None,
+    ):
+        result = await super().sign_in(
+            phone=phone,
+            code=code,
+            password=password,
+            phone_code_hash=phone_code_hash,
+        )
+        self.session_path.write_text("session", encoding="utf-8")
+        self.session_path.chmod(0o644)
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = self.session_path.with_name(f"{self.session_path.name}{suffix}")
+            sidecar.write_text("sidecar", encoding="utf-8")
+            sidecar.chmod(0o644)
+        return result
+
+
 class DelayedSendCodeClient(FakeTelegramClient):
     def __init__(self):
         super().__init__()
@@ -189,6 +220,18 @@ class DelayedSendCodeClient(FakeTelegramClient):
         self.send_code_started.set()
         await self.release_send_code.wait()
         return await super().send_code_request(phone)
+
+
+class DelayedConnectClient(FakeTelegramClient):
+    def __init__(self, connect_started: asyncio.Event, connect_release: asyncio.Event):
+        super().__init__()
+        self.connect_started = connect_started
+        self.connect_release = connect_release
+
+    async def connect(self):
+        self.connect_started.set()
+        await self.connect_release.wait()
+        self.connected = True
 
 
 class FakeClientFactory:
@@ -217,6 +260,10 @@ def _manager(
         ttl_seconds=ttl_seconds,
         token_factory=TokenSequence(),
     )
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
 
 
 def test_start_sends_code_and_returns_public_snapshot():
@@ -284,6 +331,30 @@ def test_start_for_authorized_profile_keeps_existing_session_file(tmp_path):
     assert client.disconnected is True
 
 
+@pytest.mark.skipif(os.name != "posix", reason=POSIX_MODE_REASON)
+def test_start_for_authorized_profile_chmods_existing_session_files(tmp_path):
+    session_path = tmp_path / "authorized.session"
+    session_path.write_text("authorized", encoding="utf-8")
+    session_path.chmod(0o644)
+    sidecars = [
+        session_path.with_name(f"{session_path.name}-wal"),
+        session_path.with_name(f"{session_path.name}-shm"),
+        session_path.with_name(f"{session_path.name}-journal"),
+    ]
+    for sidecar in sidecars:
+        sidecar.write_text("sidecar", encoding="utf-8")
+        sidecar.chmod(0o644)
+    accounts = FakeAccounts(session_path=str(session_path), is_authorized=True)
+    client = FakeTelegramClient(authorized=True)
+    manager = _manager(accounts, FakeClientFactory([client]))
+
+    asyncio.run(manager.start("default"))
+
+    assert _mode(session_path) == 0o600
+    for sidecar in sidecars:
+        assert _mode(sidecar) == 0o600
+
+
 def test_already_authorized_client_returns_authorized_and_marks_account():
     accounts = FakeAccounts()
     client = FakeTelegramClient(authorized=True)
@@ -315,6 +386,21 @@ def test_submit_code_authorizes_marks_account_and_disconnects():
     assert client.phone_code_hash == PHONE_CODE_HASH
     with pytest.raises(UnknownLoginError):
         asyncio.run(manager.status(started["login_id"]))
+
+
+@pytest.mark.skipif(os.name != "posix", reason=POSIX_MODE_REASON)
+def test_submit_code_chmods_session_files_created_during_login(tmp_path):
+    session_path = tmp_path / "created.session"
+    accounts = FakeAccounts(session_path=str(session_path), is_authorized=False)
+    client = SessionWritingClient(session_path)
+    manager = _manager(accounts, FakeClientFactory([client]))
+
+    started = asyncio.run(manager.start("default"))
+    asyncio.run(manager.submit_code(started["login_id"], VALID_CODE))
+
+    assert _mode(session_path) == 0o600
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert _mode(session_path.with_name(f"{session_path.name}{suffix}")) == 0o600
 
 
 def test_password_required_then_password_success():
@@ -477,7 +563,7 @@ def test_concurrent_start_for_same_profile_keeps_only_latest_flow():
         first_task = asyncio.create_task(manager.start("default"))
         await first_client.send_code_started.wait()
         second_task = asyncio.create_task(manager.start("default"))
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
 
         assert second_client.connected is False
         first_client.release_send_code.set()
@@ -494,6 +580,42 @@ def test_concurrent_start_for_same_profile_keeps_only_latest_flow():
     with pytest.raises(UnknownLoginError):
         asyncio.run(manager.status(first["login_id"]))
     assert asyncio.run(manager.status(second["login_id"]))["login_id"] == "login-2"
+
+
+def test_concurrent_start_for_same_profile_via_session_lock_across_managers(tmp_path: Path):
+    async def run_scenario():
+        session_path = tmp_path / "default.session"
+        accounts = FakeAccounts(session_path=str(session_path))
+        connect_started = asyncio.Event()
+        connect_release = asyncio.Event()
+        first_client = DelayedConnectClient(connect_started, connect_release)
+        second_client = FakeTelegramClient()
+        first_manager = _manager(
+            accounts,
+            FakeClientFactory([first_client]),
+        )
+        second_manager = _manager(
+            accounts,
+            FakeClientFactory([second_client]),
+        )
+
+        first_task = asyncio.create_task(first_manager.start("default"))
+        await connect_started.wait()
+        second_task = asyncio.create_task(second_manager.start("default"))
+        await asyncio.sleep(0.05)
+
+        assert second_client.connected is False
+        connect_release.set()
+        first = await first_task
+        second = await second_task
+        return first, second, first_client, second_client
+
+    first, second, first_client, second_client = asyncio.run(run_scenario())
+
+    assert first["step"] == "code_sent"
+    assert second["step"] == "code_sent"
+    assert first_client.connected is True
+    assert second_client.connected is True
 
 
 def test_start_error_returns_sanitized_telegram_reason_without_login_flow():
@@ -520,6 +642,40 @@ def test_start_error_returns_sanitized_telegram_reason_without_login_flow():
     assert "<phone>" in message
     assert "<token>" in message
     assert client.disconnected is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason=POSIX_MODE_REASON)
+def test_start_failure_chmods_sidecars_created_during_disconnect(tmp_path):
+    session_path = tmp_path / "start-failure.session"
+    accounts = FakeAccounts(session_path=str(session_path))
+
+    class FailingSendCodeClient(FakeTelegramClient):
+        def __init__(self):
+            super().__init__()
+            self.session_path = session_path
+
+        async def send_code_request(self, phone: str):
+            raise RuntimeError("send failed")
+
+        async def disconnect(self):
+            await super().disconnect()
+            self.session_path.write_text("session", encoding="utf-8")
+            self.session_path.chmod(0o644)
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = self.session_path.with_name(f"{self.session_path.name}{suffix}")
+                sidecar.write_text("sidecar", encoding="utf-8")
+                sidecar.chmod(0o644)
+
+    client = FailingSendCodeClient()
+    manager = _manager(accounts, FakeClientFactory([client]))
+
+    with pytest.raises(TelegramLoginAuthError):
+        asyncio.run(manager.start("default"))
+
+    assert client.disconnected is True
+    assert _mode(session_path) == 0o600
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert _mode(session_path.with_name(f"{session_path.name}{suffix}")) == 0o600
 
 
 def test_public_snapshots_do_not_leak_raw_phone_api_hash_session_or_login_secrets():

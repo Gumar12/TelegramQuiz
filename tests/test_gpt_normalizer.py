@@ -576,6 +576,79 @@ def test_prepare_media_inputs_resolves_missing_media_against_media_root(tmp_path
     ]
 
 
+def test_resolve_media_path_rejects_absolute_path_outside_trusted_root(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    outside = tmp_path / "secret"
+    outside.mkdir()
+    target = outside / "passwd.png"
+    target.write_bytes(b"image-bytes")
+
+    # An absolute path that exists but lives outside the trusted media root must
+    # not be honoured, even though resolution by filename could otherwise hit it.
+    assert gpt_normalizer.resolve_media_path(str(target), media_root=media_root) is None
+
+
+def test_resolve_media_path_rejects_parent_traversal_escape(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"image-bytes")
+
+    assert gpt_normalizer.resolve_media_path("../outside.png", media_root=media_root) is None
+
+
+def test_resolve_media_path_rejects_unknown_media_path(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+
+    assert gpt_normalizer.resolve_media_path("media/missing.png", media_root=media_root) is None
+
+
+def test_resolve_media_path_rejects_disallowed_suffix(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    (media_root / "payload.exe").write_bytes(b"not-an-image")
+
+    assert gpt_normalizer.resolve_media_path("media/payload.exe", media_root=media_root) is None
+
+
+def test_prepare_image_data_url_blocks_oversize_fallback(tmp_path, monkeypatch):
+    image_path = tmp_path / "huge.png"
+    image_path.write_bytes(b"x" * 16)
+
+    monkeypatch.setattr(gpt_normalizer, "MAX_IMAGE_PAYLOAD_BYTES", 8)
+    monkeypatch.setattr(gpt_normalizer, "_probe_image_size", lambda path, ffprobe_path, timeout: (2000, 1200))
+
+    def fake_run(cmd, check, capture_output, timeout):
+        raise OSError("ffmpeg missing")
+
+    monkeypatch.setattr(gpt_normalizer.subprocess, "run", fake_run)
+
+    with pytest.raises(gpt_normalizer.OversizeMediaError):
+        prepare_image_data_url(image_path, ffmpeg_path="ffmpeg", max_side=1024, jpeg_quality=3)
+
+
+def test_prepare_media_inputs_drops_oversize_fallback_instead_of_sending(tmp_path, monkeypatch):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    image_path = media_root / "huge.png"
+    image_path.write_bytes(b"x" * 16)
+    raw = sample_raw_question().model_copy(update={"media": ["media/huge.png"]})
+
+    monkeypatch.setattr(gpt_normalizer, "MAX_IMAGE_PAYLOAD_BYTES", 8)
+    monkeypatch.setattr(gpt_normalizer, "_probe_image_size", lambda path, ffprobe_path, timeout: (2000, 1200))
+    monkeypatch.setattr(
+        gpt_normalizer.subprocess,
+        "run",
+        lambda cmd, check, capture_output, timeout: (_ for _ in ()).throw(OSError("ffmpeg missing")),
+    )
+
+    media_inputs = prepare_media_inputs(raw, image_detail="high", media_root=media_root)
+
+    assert media_inputs == []
+
+
 def test_call_openai_normalizer_passes_prepared_media_to_responses(monkeypatch):
     raw = sample_raw_question().model_copy(update={"media": ["media/image.jpg"]})
     captured: dict[str, object] = {}
@@ -1021,3 +1094,33 @@ def test_normalize_dataset_deterministic_shuffle_preserves_correct_answer_positi
     assert review_again == []
     assert clean_again[0].options == clean[0].options
     assert clean_again[0].correct == clean[0].correct
+
+
+def test_shuffle_options_keeps_correct_with_duplicate_option_texts():
+    from backend.gpt_normalizer import shuffle_options
+    from backend.normalizer_models import CleanQuestion
+
+    # Two options share the exact same text but only the second one (index 2)
+    # is correct. A text-based .index() mapping after shuffle would lock onto
+    # the first "Дубликат" and corrupt correctness; the flag-carrying shuffle
+    # must keep the originally-correct option correct.
+    item = CleanQuestion(
+        source_item_id=1,
+        question="Который дубликат верный?",
+        correct_answer="Дубликат",
+        options=["Тимур", "Дубликат", "Дубликат", "Абылай"],
+        correct=2,
+        explanation="",
+        explanation_full="",
+    )
+
+    for seed in range(20):
+        shuffled = shuffle_options(item, seed)
+        assert sorted(shuffled.options) == sorted(item.options)
+        correct_index = (
+            shuffled.correct if isinstance(shuffled.correct, int) else shuffled.correct[0]
+        )
+        # Exactly one option flagged correct, and it is a "Дубликат".
+        assert isinstance(shuffled.correct, int)
+        assert shuffled.options[correct_index - 1] == "Дубликат"
+        assert shuffled.correct_answer == "Дубликат"

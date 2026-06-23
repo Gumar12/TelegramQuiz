@@ -379,7 +379,10 @@ function editorGroupToQuizGroup(group: QuizEditorGroup): QuizGroup {
     description: group.description ?? '',
     questions: group.questions.map((question) => ({
       ...question,
-      correct: typeof question.correct === 'number' ? question.correct : 0,
+      // Preserve a missing/null correct answer as an invalid sentinel (-1)
+      // instead of silently defaulting to the first option; validation must
+      // keep blocking it before launch.
+      correct: typeof question.correct === 'number' ? question.correct : -1,
       options: Array.isArray(question.options) ? question.options : [],
       question: question.question ?? '',
     })),
@@ -443,6 +446,8 @@ export default function App() {
   const activeJobStatus = useRef<TaskStatus>('idle');
   const jobWatchGeneration = useRef(0);
   const telegramLoginRequest = useRef(0);
+  const jobWaitAbort = useRef<AbortController>(new AbortController());
+  const refreshRunsInFlight = useRef(false);
 
   const refreshGroups = async () => {
     try {
@@ -472,21 +477,27 @@ export default function App() {
   };
 
   const refreshRuns = async () => {
-    const [runsResult, activeRunResult] = await Promise.allSettled([
-      api.getRuns(),
-      api.getActiveRun(),
-    ]);
+    if (refreshRunsInFlight.current) return;
+    refreshRunsInFlight.current = true;
+    try {
+      const [runsResult, activeRunResult] = await Promise.allSettled([
+        api.getRuns(),
+        api.getActiveRun(),
+      ]);
 
-    if (runsResult.status === 'fulfilled') setRuns(runsResult.value);
-    else {
-      console.error(runsResult.reason);
-      setRuns([]);
-    }
+      if (runsResult.status === 'fulfilled') setRuns(runsResult.value);
+      else {
+        console.error(runsResult.reason);
+        setRuns([]);
+      }
 
-    if (activeRunResult.status === 'fulfilled') setActiveRun(activeRunResult.value);
-    else {
-      console.error(activeRunResult.reason);
-      setActiveRun({ active: false });
+      if (activeRunResult.status === 'fulfilled') setActiveRun(activeRunResult.value);
+      else {
+        console.error(activeRunResult.reason);
+        setActiveRun({ active: false });
+      }
+    } finally {
+      refreshRunsInFlight.current = false;
     }
   };
 
@@ -507,6 +518,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    const abortController = jobWaitAbort.current;
     refreshGroups();
     refreshAccounts();
     refreshRuns();
@@ -514,8 +526,29 @@ export default function App() {
     return () => {
       jobWatchGeneration.current += 1;
       activeEventSource.current?.close();
+      // Abort any in-flight waitForJob polling so it stops promptly on unmount.
+      abortController.abort();
     };
   }, []);
+
+  // Fallback run-polling: when no live EventSource is streaming job updates but
+  // there are still non-terminal runs, periodically refresh so the runs view
+  // converges without depending on the original SSE connection.
+  const hasNonTerminalRun = useMemo(() => {
+    const isNonTerminal = (status: string) =>
+      !['completed', 'failed', 'cancelled', 'cancelled_replaced'].includes(status);
+    if (activeRun.active && isNonTerminal(activeRun.status)) return true;
+    return runs.some((run) => isNonTerminal(run.status));
+  }, [activeRun, runs]);
+
+  useEffect(() => {
+    if (!hasNonTerminalRun) return;
+    const interval = window.setInterval(() => {
+      if (activeEventSource.current) return;
+      void refreshRuns();
+    }, 5000);
+    return () => window.clearInterval(interval);
+  }, [hasNonTerminalRun]);
 
   const applyJobEvent = (event: JobEvent) => {
     const running = event.status === 'running';
@@ -575,7 +608,10 @@ export default function App() {
     ));
 
     try {
-      const snapshot = await api.waitForJob(jobId);
+      const snapshot = await api.waitForJob(jobId, {
+        signal: jobWaitAbort.current.signal,
+        timeoutMs: 10 * 60 * 1000,
+      });
       if (jobWatchGeneration.current !== generation) return;
       applyJobSnapshot(snapshot);
     } catch (error) {
@@ -635,7 +671,9 @@ export default function App() {
     });
     const response = await api.createQuizFromDocx(file, title, description, normalizedWorkspace, useAiParsing);
     watchJob(response.job_id, 'parsing', title, 'create');
-    const snapshot = await api.waitForJob(response.job_id);
+    const snapshot = await api.waitForJob(response.job_id, {
+      signal: jobWaitAbort.current.signal,
+    });
     await refreshGroups();
     if (snapshot.status === 'failed') {
       throw new Error(snapshot.error || 'Не удалось создать JSON из DOCX');
@@ -683,7 +721,9 @@ export default function App() {
 
   const validateGroup = async (groupId: string, strict: boolean): Promise<ValidationReport> => {
     const response = await api.validateGroup(groupId, strict);
-    const snapshot = await api.waitForJob(response.job_id);
+    const snapshot = await api.waitForJob(response.job_id, {
+      signal: jobWaitAbort.current.signal,
+    });
     refreshGroups();
     if (snapshot.status === 'failed') {
       throw new Error(snapshot.error || 'Validation failed');

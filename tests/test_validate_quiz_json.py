@@ -109,6 +109,30 @@ def test_validate_file_blocks_duplicate_questions_without_quiz_flag(tmp_path: Pa
     assert validate_quiz_json.validate_file(path, strict=False) == 1
 
 
+def test_validate_file_blocks_null_correct_answer(tmp_path: Path):
+    payload = valid_payload()
+    payload["questions"][0]["context"] = "Достаточно длинный контекст для проверки."
+    payload["questions"][0]["options"] = ["1916 год", "1917 год", "1918 год", "1919 год"]
+    payload["questions"][0]["correct"] = None
+    path = tmp_path / "quiz.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    # A null correct answer must keep the upload gate blocked, never be coerced
+    # to the first option.
+    assert validate_quiz_json.validate_file(path, strict=False) == 1
+
+
+def test_validate_file_blocks_missing_correct_answer(tmp_path: Path):
+    payload = valid_payload()
+    payload["questions"][0]["context"] = "Достаточно длинный контекст для проверки."
+    payload["questions"][0]["options"] = ["1916 год", "1917 год", "1918 год", "1919 год"]
+    del payload["questions"][0]["correct"]
+    path = tmp_path / "quiz.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert validate_quiz_json.validate_file(path, strict=False) == 1
+
+
 def test_configure_stdout_reconfigures_to_utf8(monkeypatch):
     calls = []
 
