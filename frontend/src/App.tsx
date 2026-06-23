@@ -441,6 +441,9 @@ export default function App() {
   const [pendingEditorExit, setPendingEditorExit] = useState<QuizEditorExitRequest | null>(null);
   const [archiveDeleteError, setArchiveDeleteError] = useState('');
   const [archiveDeleteSubmitting, setArchiveDeleteSubmitting] = useState(false);
+  const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
+  const [stopError, setStopError] = useState('');
+  const [stoppingRunIds, setStoppingRunIds] = useState<Set<string>>(new Set());
   const modal = useModalStore();
   const activeEventSource = useRef<EventSource | null>(null);
   const activeJobStatus = useRef<TaskStatus>('idle');
@@ -506,7 +509,10 @@ export default function App() {
       const nextSettings = await api.getSettings();
       setSettings(nextSettings);
       setWorkspaceConfig((current) => ({
-        workspaceDir: nextSettings.workspace_dir || current.workspaceDir,
+        // workspace_dir из settings — абсолютный корень сервера (информационное поле).
+        // Поле «Рабочая папка» при создании квиза требует относительный путь внутри data,
+        // поэтому держим относительный дефолт и не затираем его абсолютным значением.
+        workspaceDir: current.workspaceDir,
         sourcePath: nextSettings.source_path || current.sourcePath,
         outputDir: nextSettings.quizzes_dir || current.outputDir,
         mediaRoot: nextSettings.media_dir || current.mediaRoot,
@@ -518,7 +524,10 @@ export default function App() {
   };
 
   useEffect(() => {
-    const abortController = jobWaitAbort.current;
+    // Свежий контроллер на каждый mount: цикл StrictMode mount→cleanup→mount
+    // не оставит нас с навсегда-аборченным сигналом для waitForJob.
+    const abortController = new AbortController();
+    jobWaitAbort.current = abortController;
     refreshGroups();
     refreshAccounts();
     refreshRuns();
@@ -549,6 +558,20 @@ export default function App() {
     }, 5000);
     return () => window.clearInterval(interval);
   }, [hasNonTerminalRun]);
+
+  // Снимаем переходную пометку «останавливается», когда refreshRuns показал
+  // терминальный статус — индикация исчезает только после реальной остановки.
+  useEffect(() => {
+    setStoppingRunIds((current) => {
+      if (current.size === 0) return current;
+      const terminal = new Set(['cancelled', 'cancelled_replaced', 'failed', 'completed']);
+      const next = new Set(current);
+      runs.forEach((run) => {
+        if (terminal.has(run.status)) next.delete(getRunId(run));
+      });
+      return next.size === current.size ? current : next;
+    });
+  }, [runs]);
 
   const applyJobEvent = (event: JobEvent) => {
     const running = event.status === 'running';
@@ -1199,6 +1222,7 @@ export default function App() {
   };
 
   const handleStopRun = (run: RunSummary) => {
+    setStopError('');
     openModal('stop-run', {
       accountName: run.accountName,
       canStop: true,
@@ -1225,16 +1249,43 @@ export default function App() {
   };
 
   const confirmStopRun = async (runId: string) => {
+    setStoppingRunId(runId);
+    setStopError('');
     try {
       if (pipeline.activeJobId === runId) {
         await api.cancelJob(runId);
       } else {
         await api.stopRun(runId);
       }
+      setStoppingRunIds((current) => {
+        const next = new Set(current);
+        next.add(runId);
+        return next;
+      });
       closeCurrentModal();
       await refreshRuns();
     } catch (error) {
       console.error(error);
+      const message = errorLabel(error);
+      const alreadyTerminal =
+        /already terminal/i.test(message) ||
+        (error instanceof Error && /already terminal/i.test(error.message));
+      if (alreadyTerminal) {
+        // Фронт отстал от бэкенда: запуск уже завершён, но pipeline/SSE завис в
+        // «uploading» и держит фантомный «текущий запуск» с активной кнопкой стопа.
+        // Сбрасываем залипший pipeline (только если он про этот запуск), закрываем
+        // модалку и синхронизируем список — без плашки, раз останавливать уже нечего.
+        if (pipeline.activeJobId === runId || pipelineRunSummary?.id === runId) {
+          activeJobStatus.current = 'idle';
+          setPipeline(idlePipeline);
+        }
+        closeCurrentModal();
+        await refreshRuns();
+      } else {
+        setStopError(message);
+      }
+    } finally {
+      setStoppingRunId(null);
     }
   };
 
@@ -1263,6 +1314,7 @@ export default function App() {
     setPendingEditorExit(null);
     setArchiveDeleteError('');
     setArchiveDeleteSubmitting(false);
+    setStopError('');
     closeModal();
   };
 
@@ -1319,6 +1371,7 @@ export default function App() {
           <RunsScreen
             controlsEnabled={runsControlsEnabled}
             currentRun={runsCurrentRun}
+            currentRunStopping={Boolean(runsCurrentRun && stoppingRunIds.has(runsCurrentRun.id))}
             dangerousActionsEnabled={Boolean(runsCurrentRun)}
             launchQuiz={launchQuizCandidate}
             onStartLaunchQuiz={handleStartLaunchQuiz}
@@ -1430,7 +1483,9 @@ export default function App() {
 
       {modal.modalId === 'stop-run' && (
         <StopRunModal
+          error={stopError}
           isOpen
+          isStopping={stoppingRunId === modal.payload.runId}
           onClose={closeCurrentModal}
           onConfirm={confirmStopRun}
           payload={modal.payload}

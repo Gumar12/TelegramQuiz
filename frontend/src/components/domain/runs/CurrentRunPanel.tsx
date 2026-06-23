@@ -10,6 +10,7 @@ import type { RunSummary } from './types';
 type CurrentRunPanelProps = {
   controlsEnabled?: boolean;
   dangerousActionsEnabled?: boolean;
+  isStopping?: boolean;
   onContinueRun?: (run: RunSummary, questionIndex: number) => Promise<void> | void;
   onObserveRun?: (run: RunSummary) => void;
   onPauseRun?: (run: RunSummary) => void;
@@ -107,6 +108,7 @@ function messageFromError(error: unknown): string {
 export function CurrentRunPanel({
   controlsEnabled = false,
   dangerousActionsEnabled = false,
+  isStopping = false,
   onContinueRun,
   onObserveRun,
   onPauseRun,
@@ -382,12 +384,13 @@ export function CurrentRunPanel({
             )}
             {canStop && (
               <Button
+                disabled={isStopping}
                 icon={<Square className="size-4" aria-hidden="true" />}
                 onClick={() => onStopRun?.(run)}
                 size="sm"
                 variant="danger"
               >
-                Остановить
+                {isStopping ? 'Останавливается…' : 'Остановить'}
               </Button>
             )}
           </div>

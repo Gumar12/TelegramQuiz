@@ -16,6 +16,7 @@ export type LaunchQuizCandidate = {
 export type RunsScreenProps = {
   controlsEnabled?: boolean;
   currentRun?: RunSummary | null;
+  currentRunStopping?: boolean;
   dangerousActionsEnabled?: boolean;
   launchQuiz?: LaunchQuizCandidate | null;
   onAddToQueue?: () => void;
@@ -40,6 +41,7 @@ export type RunsScreenProps = {
 export default function RunsScreen({
   controlsEnabled = false,
   currentRun = null,
+  currentRunStopping = false,
   dangerousActionsEnabled = false,
   launchQuiz = null,
   onAddToQueue,
@@ -145,6 +147,7 @@ export default function RunsScreen({
         <CurrentRunPanel
           controlsEnabled={controlsEnabled}
           dangerousActionsEnabled={dangerousActionsEnabled}
+          isStopping={currentRunStopping}
           onContinueRun={onContinueRun}
           onObserveRun={onObserveRun}
           onPauseRun={onPauseRun}

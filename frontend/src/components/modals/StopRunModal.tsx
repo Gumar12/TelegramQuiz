@@ -10,9 +10,11 @@ type StopRunModalProps = {
   onClose: () => void;
   payload: StopRunModalPayload;
   onConfirm?: (runId: string) => void;
+  isStopping?: boolean;
+  error?: string;
 };
 
-export function StopRunModal({ isOpen, onClose, onConfirm, payload }: StopRunModalProps) {
+export function StopRunModal({ isOpen, onClose, onConfirm, payload, isStopping = false, error }: StopRunModalProps) {
   const progress =
     payload.totalQuestions > 0 ? Math.round((payload.completedQuestions / payload.totalQuestions) * 100) : 0;
   const canStop = payload.canStop === true && Boolean(onConfirm);
@@ -24,11 +26,16 @@ export function StopRunModal({ isOpen, onClose, onConfirm, payload }: StopRunMod
       title="Остановить запуск?"
       footer={
         <>
-          <Button onClick={onClose} variant="outline">
+          <Button disabled={isStopping} onClick={onClose} variant="outline">
             Отмена
           </Button>
-          <Button disabled={!canStop} onClick={() => onConfirm?.(payload.runId)} variant="danger">
-            Остановить
+          <Button
+            disabled={!canStop || isStopping}
+            loading={isStopping}
+            onClick={() => onConfirm?.(payload.runId)}
+            variant="danger"
+          >
+            {isStopping ? 'Останавливаю…' : 'Остановить'}
           </Button>
         </>
       }
@@ -47,6 +54,12 @@ export function StopRunModal({ isOpen, onClose, onConfirm, payload }: StopRunMod
         <MetaRow label="Аккаунт" value={payload.accountName} />
         <Progress value={progress} label="Текущий прогресс" />
       </SummaryCard>
+
+      {error && (
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+          {error}
+        </div>
+      )}
 
       <Notice tone="warning">Остановка не удалит квиз и не очистит очередь.</Notice>
     </Modal>
