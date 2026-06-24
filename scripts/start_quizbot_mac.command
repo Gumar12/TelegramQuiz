@@ -42,6 +42,21 @@ if [ ! -f "backend/.env" ]; then
   echo "backend/.env is only for optional service integrations."
 fi
 
+# Build the web UI if it is missing — backend serves frontend/dist, which is
+# not stored in git, so a fresh clone has no UI until it is built.
+if [ ! -d "frontend/dist" ]; then
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: the web UI is not built yet and npm (Node.js) is not installed."
+    echo "Install Node.js 20 LTS from https://nodejs.org/ and run this file again."
+    echo
+    read -r -p "Press Enter to close..."
+    exit 1
+  fi
+  echo "Building the web UI (first run, this can take a minute)..."
+  ( cd frontend && npm install && npm run build ) || exit 1
+  echo
+fi
+
 PIDS="$(lsof -tiTCP:${PORT} -sTCP:LISTEN 2>/dev/null || true)"
 if [ -n "$PIDS" ]; then
   echo "Port $PORT is busy. Stopping process(es): $PIDS"
