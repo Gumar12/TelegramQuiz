@@ -22,6 +22,10 @@ CONTEXT_OVERLAP_AUTOFIX_WARNING = (
     "Проверьте, нужен ли контекст или фото."
 )
 
+MISSING_SOURCE_BLOCKS_WARNING = (
+    "Возможно, ИИ что-то придумал — ссылка на отсутствующий блок источника"
+)
+
 
 @dataclass(slots=True)
 class SourceBlock:
@@ -532,7 +536,7 @@ def build_quiz_from_markup(
             + unknown_correct_ids
         )
         if missing:
-            quality_flags.append("missing_source_blocks: " + ", ".join(dict.fromkeys(missing)))
+            quality_flags.append(MISSING_SOURCE_BLOCKS_WARNING + ": " + ", ".join(dict.fromkeys(missing)))
         if inferred_question_ids:
             quality_flags.append(CONTEXT_OVERLAP_AUTOFIX_WARNING)
         if len("\n".join(question_texts).strip()) > 255:

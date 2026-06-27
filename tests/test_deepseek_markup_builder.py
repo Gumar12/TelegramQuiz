@@ -3,6 +3,7 @@ from pathlib import Path
 
 from backend.deepseek_markup_builder import (
     CONTEXT_OVERLAP_AUTOFIX_WARNING,
+    MISSING_SOURCE_BLOCKS_WARNING,
     SourceBlock,
     SourceBlocks,
     build_quiz_from_files,
@@ -180,7 +181,7 @@ def test_builder_resolves_existing_media_output_from_source_image_ref(tmp_path: 
 
     question = quiz["questions"][0]
     assert question["media"] == ["media/image4.jpg"]
-    assert not any("missing_source_blocks" in flag for flag in question["quality_flags"])
+    assert not any(MISSING_SOURCE_BLOCKS_WARNING in flag for flag in question["quality_flags"])
 
 
 def test_builder_drops_missing_media_ref_and_flags_it(tmp_path: Path):
@@ -213,7 +214,7 @@ def test_builder_drops_missing_media_ref_and_flags_it(tmp_path: Path):
 
     question = quiz["questions"][0]
     assert question["media"] == []
-    assert any("missing_source_blocks" in flag and "img0001:media/missing.jpg" in flag for flag in question["quality_flags"])
+    assert any(MISSING_SOURCE_BLOCKS_WARNING in flag and "img0001:media/missing.jpg" in flag for flag in question["quality_flags"])
 
 
 def _basic_source() -> SourceBlocks:
@@ -251,7 +252,7 @@ def test_builder_rejects_unknown_block_id_as_flag_not_crash():
 
     question = quiz["questions"][0]
     flags = question["quality_flags"]
-    assert any("missing_source_blocks" in flag and "b9999" in flag for flag in flags)
+    assert any(MISSING_SOURCE_BLOCKS_WARNING in flag and "b9999" in flag for flag in flags)
     # Unknown correct id was rejected, so no valid correct answer was found.
     assert any("не нашёл правильный ответ" in flag for flag in flags)
 
@@ -294,7 +295,7 @@ def test_builder_rejects_absolute_media_ref_outside_trusted_root(tmp_path: Path)
 
     question = quiz["questions"][0]
     assert question["media"] == []
-    assert any("missing_source_blocks" in flag and "img0001" in flag for flag in question["quality_flags"])
+    assert any(MISSING_SOURCE_BLOCKS_WARNING in flag and "img0001" in flag for flag in question["quality_flags"])
 
 
 def test_builder_rejects_parent_traversal_media_ref(tmp_path: Path):
@@ -333,7 +334,7 @@ def test_builder_rejects_parent_traversal_media_ref(tmp_path: Path):
 
     question = quiz["questions"][0]
     assert question["media"] == []
-    assert any("missing_source_blocks" in flag and "img0001" in flag for flag in question["quality_flags"])
+    assert any(MISSING_SOURCE_BLOCKS_WARNING in flag and "img0001" in flag for flag in question["quality_flags"])
 
 
 def test_builder_rejects_disallowed_media_suffix(tmp_path: Path):
@@ -370,7 +371,7 @@ def test_builder_rejects_disallowed_media_suffix(tmp_path: Path):
 
     question = quiz["questions"][0]
     assert question["media"] == []
-    assert any("missing_source_blocks" in flag and "img0001" in flag for flag in question["quality_flags"])
+    assert any(MISSING_SOURCE_BLOCKS_WARNING in flag and "img0001" in flag for flag in question["quality_flags"])
 
 
 def test_builder_rejects_unknown_media_id_as_flag_not_crash():
@@ -392,4 +393,4 @@ def test_builder_rejects_unknown_media_id_as_flag_not_crash():
 
     question = quiz["questions"][0]
     assert question["media"] == []
-    assert any("missing_source_blocks" in flag and "img9999" in flag for flag in question["quality_flags"])
+    assert any(MISSING_SOURCE_BLOCKS_WARNING in flag and "img9999" in flag for flag in question["quality_flags"])

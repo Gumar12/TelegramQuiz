@@ -209,6 +209,7 @@ def test_create_from_docx_ai_job_builds_final_quiz(tmp_path: Path, monkeypatch):
         media_dir=tmp_path / "media",
         output_dir=tmp_path / "quizzes",
         workspace_dir=tmp_path,
+        runtime_dir=tmp_path,
         title="AI quiz",
         description="AI description",
     )

@@ -1074,6 +1074,114 @@ export default function App() {
     }
   };
 
+  const pollTelegramQrStatus = async (
+    loginId: string,
+    requestId: number,
+    accountNameValue: string,
+    profileId: string,
+  ) => {
+    if (telegramLoginRequest.current !== requestId) return;
+    try {
+      const response = await api.getTelegramLoginStatus(loginId);
+      if (telegramLoginRequest.current !== requestId) return;
+      if (response.step === 'authorized') {
+        await completeTelegramLogin(response.account);
+        return;
+      }
+      if (response.step === 'password_required') {
+        setTelegramLogin({
+          accountName: accountNameValue,
+          loading: false,
+          loginId,
+          profileId,
+          step: 'password_required',
+        });
+        return;
+      }
+      if (response.step === 'error') {
+        setTelegramLogin({
+          accountName: accountNameValue,
+          error: response.error,
+          loading: false,
+          loginId,
+          profileId,
+          step: 'qr_pending',
+        });
+        return;
+      }
+      if (response.step === 'qr_pending') {
+        setTelegramLogin({
+          accountName: accountNameValue,
+          loading: false,
+          loginId,
+          profileId,
+          qrImage: response.qr_image,
+          qrUrl: response.qr_url,
+          step: 'qr_pending',
+        });
+        window.setTimeout(() => {
+          void pollTelegramQrStatus(loginId, requestId, accountNameValue, profileId);
+        }, 2000);
+      }
+    } catch (error) {
+      if (telegramLoginRequest.current !== requestId) return;
+      const label = errorLabel(error);
+      setTelegramLogin((current) => (
+        current?.profileId === profileId
+          ? { ...current, error: label, loading: false }
+          : current
+      ));
+    }
+  };
+
+  const handleStartTelegramQrLogin = async (account: PublicAccountProfile) => {
+    const requestId = telegramLoginRequest.current + 1;
+    telegramLoginRequest.current = requestId;
+    setActiveRoute('accounts');
+    setTelegramLogin({
+      accountName: account.name,
+      loading: true,
+      profileId: account.id,
+      step: 'starting',
+    });
+
+    try {
+      const response = await api.startTelegramQrLogin(account.id);
+      if (telegramLoginRequest.current !== requestId) return;
+      if (response.step === 'authorized') {
+        await completeTelegramLogin(response.account);
+        return;
+      }
+      setTelegramLogin({
+        accountName: account.name,
+        loading: false,
+        loginId: response.login_id,
+        profileId: account.id,
+        qrImage: response.qr_image,
+        qrUrl: response.qr_url,
+        step: 'qr_pending',
+      });
+      window.setTimeout(() => {
+        void pollTelegramQrStatus(response.login_id, requestId, account.name, account.id);
+      }, 2000);
+    } catch (error) {
+      if (telegramLoginRequest.current !== requestId) return;
+      const label = errorLabel(error);
+      setTelegramLogin((current) => (
+        current?.profileId === account.id
+          ? { ...current, error: label, loading: false }
+          : current
+      ));
+    }
+  };
+
+  const handleStartTelegramQrLoginCurrent = () => {
+    if (!telegramLogin) return;
+    const account = publicAccounts.find((item) => item.id === telegramLogin.profileId);
+    if (!account) return;
+    void handleStartTelegramQrLogin(account);
+  };
+
   const handleSubmitTelegramCode = async (code: string) => {
     if (!telegramLogin?.loginId) return;
     const currentLogin = telegramLogin;
@@ -1389,6 +1497,7 @@ export default function App() {
           <AccountsScreen
             accounts={publicAccounts}
             connectionActionsEnabled
+            onAccountCreated={refreshAccounts}
             onCancelTelegramLogin={handleCancelTelegramLogin}
             onConnectAccount={handleStartTelegramLogin}
             onDeleteAccount={handleDeleteAccount}
@@ -1397,6 +1506,7 @@ export default function App() {
             onReconnectAccount={handleStartTelegramLogin}
             onRestartTelegramLogin={handleRestartTelegramLogin}
             onSetActiveAccount={handleSetActiveAccount}
+            onStartTelegramQrLogin={handleStartTelegramQrLoginCurrent}
             onSubmitTelegramCode={handleSubmitTelegramCode}
             onSubmitTelegramPassword={handleSubmitTelegramPassword}
             managementEnabled

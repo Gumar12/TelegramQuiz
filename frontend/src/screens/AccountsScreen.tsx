@@ -15,7 +15,9 @@ export type TelegramLoginPanelState = {
   loading?: boolean;
   phoneMasked?: string;
   profileId?: string;
-  step: 'starting' | 'code_sent' | 'password_required';
+  qrImage?: string;
+  qrUrl?: string;
+  step: 'starting' | 'code_sent' | 'password_required' | 'qr_pending';
 };
 
 export type AccountsScreenProps = {
@@ -24,6 +26,7 @@ export type AccountsScreenProps = {
   telegramLogin?: TelegramLoginPanelState | null;
   managementEnabled?: boolean;
   onAddTelegram?: () => void;
+  onAccountCreated?: () => void;
   onCancelTelegramLogin?: () => void;
   onConnectAccount?: (account: PublicAccountProfile) => void;
   onDeleteAccount?: (account: PublicAccountProfile) => Promise<void> | void;
@@ -32,6 +35,7 @@ export type AccountsScreenProps = {
   onReconnectAccount?: (account: PublicAccountProfile) => void;
   onRestartTelegramLogin?: () => void;
   onSetActiveAccount?: (account: PublicAccountProfile) => void;
+  onStartTelegramQrLogin?: () => void;
   onSubmitTelegramCode?: (code: string) => void;
   onSubmitTelegramPassword?: (password: string) => void;
   switchEnabled?: boolean;
@@ -43,6 +47,7 @@ export default function AccountsScreen({
   telegramLogin = null,
   managementEnabled = false,
   onAddTelegram,
+  onAccountCreated,
   onCancelTelegramLogin,
   onConnectAccount,
   onDeleteAccount,
@@ -51,6 +56,7 @@ export default function AccountsScreen({
   onReconnectAccount,
   onRestartTelegramLogin,
   onSetActiveAccount,
+  onStartTelegramQrLogin,
   onSubmitTelegramCode,
   onSubmitTelegramPassword,
   switchEnabled = false,
@@ -97,7 +103,11 @@ export default function AccountsScreen({
         </Panel>
 
         <div className="space-y-5 xl:sticky xl:top-5 xl:self-start">
-          <AccountSecurityPanel connectionActionsEnabled={connectionActionsEnabled} onAddTelegram={onAddTelegram} />
+          <AccountSecurityPanel
+            connectionActionsEnabled={connectionActionsEnabled}
+            onAddTelegram={onAddTelegram}
+            onAccountCreated={onAccountCreated}
+          />
         </div>
       </div>
 
@@ -106,6 +116,7 @@ export default function AccountsScreen({
           login={telegramLogin}
           onCancel={onCancelTelegramLogin}
           onRestart={onRestartTelegramLogin}
+          onStartQr={onStartTelegramQrLogin}
           onSubmitCode={onSubmitTelegramCode}
           onSubmitPassword={onSubmitTelegramPassword}
         />
@@ -120,12 +131,14 @@ function TelegramLoginModal({
   login,
   onCancel,
   onRestart,
+  onStartQr,
   onSubmitCode,
   onSubmitPassword,
 }: {
   login: TelegramLoginPanelState;
   onCancel?: () => void;
   onRestart?: () => void;
+  onStartQr?: () => void;
   onSubmitCode?: (code: string) => void;
   onSubmitPassword?: (password: string) => void;
 }) {
@@ -139,6 +152,9 @@ function TelegramLoginModal({
 
   const isCodeStep = login.step === 'code_sent';
   const isPasswordStep = login.step === 'password_required';
+  const isQrStep = login.step === 'qr_pending';
+  const canStartQr =
+    Boolean(onStartQr) && !isQrStep && !isPasswordStep && !login.loading;
   const normalizedError = login.error?.toLowerCase().replace('ё', 'е') ?? '';
   const isExpiredCodeError =
     normalizedError.includes('expired')
@@ -215,6 +231,33 @@ function TelegramLoginModal({
           </form>
         )}
 
+        {isQrStep && (
+          <div className="space-y-3">
+            <p className="text-sm leading-6 text-gray-600">
+              Откройте Telegram → Настройки → Устройства → «Подключить устройство»
+              (Link Desktop Device / Сканировать QR) и наведите камеру на код.
+            </p>
+            <div className="flex justify-center">
+              {login.qrImage ? (
+                <img
+                  alt="QR-код для входа в Telegram"
+                  className="h-56 w-56 rounded-md border border-gray-200 bg-white p-2"
+                  src={login.qrImage}
+                />
+              ) : (
+                <div className="flex h-56 w-56 items-center justify-center rounded-md border border-dashed border-gray-300 text-sm text-gray-500">
+                  Готовим QR-код…
+                </div>
+              )}
+            </div>
+            <p className="text-xs leading-5 text-gray-500">
+              Код обновляется автоматически. Нужен телефон с уже выполненным входом
+              в этот аккаунт. Не показывайте этот QR никому — его сканирование даёт
+              полный доступ к аккаунту.
+            </p>
+          </div>
+        )}
+
         {login.error && (
           <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
             {login.error}
@@ -228,6 +271,11 @@ function TelegramLoginModal({
           {canRequestCodeAgain && (
             <Button disabled={login.loading || !onRestart} onClick={onRestart} variant="outline">
               {isExpiredCodeError ? 'Запросить новый код' : 'Код не пришёл, запросить снова'}
+            </Button>
+          )}
+          {canStartQr && (
+            <Button disabled={login.loading} onClick={onStartQr} variant="outline">
+              Код не приходит? Войти по QR-коду
             </Button>
           )}
         </div>

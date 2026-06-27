@@ -214,6 +214,13 @@ class UseAccountProfileRequest(BaseModel):
     profile_id: str
 
 
+class CreateAccountProfileRequest(BaseModel):
+    display_name: str
+    api_id: int
+    api_hash: str
+    phone: str
+
+
 class ContinueRunRequest(BaseModel):
     question_index: int
     confirm_rollback: bool = False
@@ -232,9 +239,17 @@ class EtaSettingsRequest(BaseModel):
     bot_response_seconds: float | None = None
 
 
+class DeepSeekKeyRequest(BaseModel):
+    api_key: str
+
+
 class TelegramLoginStartRequest(BaseModel):
     profile_id: str
     force_sms: bool = False
+
+
+class TelegramLoginQrStartRequest(BaseModel):
+    profile_id: str
 
 
 class TelegramLoginCodeRequest(BaseModel):
@@ -861,13 +876,16 @@ def _create_from_docx_ai_job(
     media_dir: Path,
     output_dir: Path,
     workspace_dir: Path,
+    runtime_dir: Path,
     title: str,
     description: str,
 ):
     def run(job_id: str, manager: JobManager) -> dict[str, Any]:
-        if not config.DEEPSEEK_API_KEY:
+        api_key = config.resolve_deepseek_api_key(runtime_dir)
+        if not api_key:
             raise RuntimeError(
-                "DEEPSEEK_API_KEY не задан. Добавьте токен в backend/.env и перезапустите backend."
+                "DEEPSEEK_API_KEY не задан. Укажите ключ в разделе «Аккаунты → DeepSeek API» "
+                "или в backend/.env."
             )
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -898,7 +916,7 @@ def _create_from_docx_ai_job(
         )
         markup, raw_response = deepseek_markup.request_markup(
             blocks_md,
-            api_key=config.DEEPSEEK_API_KEY,
+            api_key=api_key,
             model=config.DEEPSEEK_MODEL,
             base_url=config.DEEPSEEK_BASE_URL,
             timeout_seconds=config.DEEPSEEK_TIMEOUT_SECONDS,
@@ -1456,11 +1474,21 @@ def create_app(
         return {"accounts": [_account_profile_payload(profile) for profile in profiles]}
 
     @app.post("/api/accounts")
-    def create_account_profile_disabled() -> dict[str, Any]:
-        raise HTTPException(
-            status_code=405,
-            detail="Account profile creation is not available in the web UI",
-        )
+    def create_account_profile(request: CreateAccountProfileRequest) -> dict[str, Any]:
+        try:
+            profile = accounts.create_profile(
+                display_name=request.display_name,
+                api_id=request.api_id,
+                api_hash=request.api_hash,
+                phone=request.phone,
+                changed_by="ui",
+                store_root=app.state.account_store_root,
+            )
+        except accounts.AccountProfileError as exc:
+            _raise_account_http_error(exc)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"account": _account_profile_payload(profile)}
 
     @app.patch("/api/accounts/{profile_id}")
     def update_account_profile_disabled(profile_id: str) -> dict[str, Any]:
@@ -1538,6 +1566,13 @@ def create_app(
                 request.profile_id,
                 force_sms=request.force_sms,
             )
+        except Exception as exc:
+            _raise_telegram_login_http_error(exc)
+
+    @app.post("/api/auth/telegram/qr/start")
+    async def start_telegram_qr_login(request: TelegramLoginQrStartRequest) -> dict[str, Any]:
+        try:
+            return await app.state.telegram_login_manager.start_qr(request.profile_id)
         except Exception as exc:
             _raise_telegram_login_http_error(exc)
 
@@ -1777,6 +1812,23 @@ def create_app(
         eta_settings = config.save_eta_settings(updates, app.state.runtime_dir)
         return {"eta": eta_settings}
 
+    @app.get("/api/settings/deepseek")
+    def deepseek_settings() -> dict[str, Any]:
+        return config.deepseek_key_status(app.state.runtime_dir)
+
+    @app.put("/api/settings/deepseek")
+    def update_deepseek_settings(request: DeepSeekKeyRequest) -> dict[str, Any]:
+        try:
+            config.save_deepseek_api_key(request.api_key, app.state.runtime_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="API-ключ не может быть пустым")
+        return config.deepseek_key_status(app.state.runtime_dir)
+
+    @app.delete("/api/settings/deepseek")
+    def delete_deepseek_settings() -> dict[str, Any]:
+        config.delete_deepseek_api_key(app.state.runtime_dir)
+        return config.deepseek_key_status(app.state.runtime_dir)
+
     @app.get("/api/media/{media_path:path}")
     def media(media_path: str) -> FileResponse:
         media_dir = Path(app.state.media_dir).resolve()
@@ -1862,6 +1914,7 @@ def create_app(
                     media_dir=ctx.media_dir,
                     output_dir=ctx.quizzes_dir,
                     workspace_dir=ctx.workspace_dir,
+                    runtime_dir=app.state.runtime_dir,
                     title=title,
                     description=description,
                 ),

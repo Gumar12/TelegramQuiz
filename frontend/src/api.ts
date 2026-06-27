@@ -7,9 +7,11 @@ import {
   QuizGroup,
   GroupSummary,
   RunStatusSnapshot,
+  DeepSeekKeyStatus,
   SettingsResponse,
   TelegramLoginAuthorizedResponse,
   TelegramLoginCodeResponse,
+  TelegramLoginQrStartResponse,
   TelegramLoginStartResponse,
   TelegramLoginStatusResponse,
   WaitForJobOptions,
@@ -93,8 +95,22 @@ export const api = {
     return payload.account;
   },
 
-  async createAccount(_options: unknown): Promise<AccountProfilePublic> {
-    throw new Error(ACCOUNT_MANAGEMENT_DISABLED);
+  async createAccount(options: {
+    displayName: string;
+    apiId: number;
+    apiHash: string;
+    phone: string;
+  }): Promise<AccountProfilePublic> {
+    const payload = await request<{ account: AccountProfilePublic }>('/api/accounts', {
+      method: 'POST',
+      body: JSON.stringify({
+        display_name: options.displayName,
+        api_id: options.apiId,
+        api_hash: options.apiHash,
+        phone: options.phone,
+      }),
+    });
+    return payload.account;
   },
 
   async updateAccount(
@@ -189,6 +205,19 @@ export const api = {
       body: JSON.stringify(options),
     }),
 
+  getDeepSeekKeyStatus: () => request<DeepSeekKeyStatus>('/api/settings/deepseek'),
+
+  saveDeepSeekKey: (apiKey: string) =>
+    request<DeepSeekKeyStatus>('/api/settings/deepseek', {
+      method: 'PUT',
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+
+  deleteDeepSeekKey: () =>
+    request<DeepSeekKeyStatus>('/api/settings/deepseek', {
+      method: 'DELETE',
+    }),
+
   startTelegramLogin: (profileId: string, options: { forceSms?: boolean } = {}) =>
     request<TelegramLoginStartResponse>('/api/auth/telegram/start', {
       method: 'POST',
@@ -196,6 +225,12 @@ export const api = {
         force_sms: options.forceSms ?? false,
         profile_id: profileId,
       }),
+    }),
+
+  startTelegramQrLogin: (profileId: string) =>
+    request<TelegramLoginQrStartResponse>('/api/auth/telegram/qr/start', {
+      method: 'POST',
+      body: JSON.stringify({ profile_id: profileId }),
     }),
 
   submitTelegramCode: (loginId: string, code: string) =>

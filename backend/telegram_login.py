@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
+import io
 import logging
 import re
 import secrets
@@ -13,8 +15,32 @@ from typing import Any, Callable
 
 from backend import accounts, config, telegram_client_factory
 
-LOGIN_TTL_SECONDS = 300
+try:
+    import qrcode
+except ImportError:  # pragma: no cover - QR login degrades gracefully without dep
+    qrcode = None
+
+# App-коды Telegram нередко приходят с задержкой; даём пользователю запас,
+# чтобы flow не «истёк» пока он ищет код в служебном чате.
+LOGIN_TTL_SECONDS = 900
 log = logging.getLogger(__name__)
+
+
+def _qr_png_data_url(url: str) -> str:
+    """Render a tg://login QR URL as a base64 PNG data URL.
+
+    The URL is a session-grade secret (scanning it authorizes the account), so
+    callers must never log the returned value — only serve it to the local UI.
+    """
+    if qrcode is None:
+        raise TelegramLoginError(
+            "QR login is unavailable: install qrcode[pil]"
+        )
+    image = qrcode.make(url)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 class TelegramLoginError(ValueError):
@@ -64,6 +90,12 @@ class TelegramLoginFlow:
     step: str
     expires_at: datetime
     client: Any
+    qr: Any = None
+    qr_url: str | None = None
+    qr_image: str | None = None
+    task: Any = None
+    error: str | None = None
+    account: Any = None
 
 
 class TelegramLoginManager:
@@ -147,10 +179,11 @@ class TelegramLoginManager:
                     force_sms=force_sms,
                 )
                 log.info(
-                    "telegram_login.send_code_request.ok profile=%s delivery=%s next=%s",
+                    "telegram_login.send_code_request.ok profile=%s delivery=%s next=%s timeout=%s",
                     profile_id,
                     _sent_code_delivery_name(getattr(sent_code, "type", None)),
                     _sent_code_delivery_name(getattr(sent_code, "next_type", None)),
+                    getattr(sent_code, "timeout", None),
                 )
                 login_id = self.token_factory()
                 expires_at = self._now() + timedelta(seconds=self.ttl_seconds)
@@ -182,6 +215,195 @@ class TelegramLoginManager:
                 )
                 raise TelegramLoginAuthError(safe_error) from exc
 
+    async def start_qr(self, profile_id: str) -> dict[str, Any]:
+        """Start or replace a QR-code Telegram login flow for an existing profile."""
+
+        lock = self._profile_locks.setdefault(profile_id, asyncio.Lock())
+        async with lock:
+            return await self._start_qr_locked(profile_id)
+
+    async def _start_qr_locked(self, profile_id: str) -> dict[str, Any]:
+        await self.cleanup_expired()
+        await self._cancel_profile_flow(profile_id)
+
+        profile = self._load_private_profile(profile_id)
+        self._assert_credentials(profile)
+        log.info(
+            "telegram_login.qr_start profile=%s authorized=%s",
+            profile_id,
+            bool(getattr(profile, "is_authorized", False)),
+        )
+        if not bool(getattr(profile, "is_authorized", False)):
+            _delete_session_files(Path(str(getattr(profile, "session_path", "") or "")))
+        session_path = Path(str(getattr(profile, "session_path", "") or "")).expanduser()
+        client = self._create_client(profile_id)
+
+        async with telegram_client_factory.session_file_lock(session_path):
+            try:
+                await self._connect(client)
+                accounts._chmod_session_files(session_path)
+                log.info("telegram_login.qr_connected profile=%s", profile_id)
+                if await self._is_user_authorized(client):
+                    account = self._mark_authorized(profile_id, authorized=True)
+                    await self._disconnect(client)
+                    accounts._chmod_session_files(session_path)
+                    log.info("telegram_login.qr_already_authorized profile=%s", profile_id)
+                    return self._authorized_snapshot(account)
+                # is_user_authorized() is False here, so qr.url is safe to read
+                # (guards against the LoginTokenSuccess AttributeError, Telethon #3922).
+                qr = await self._qr_login(client)
+                qr_url = qr.url
+                qr_image = _qr_png_data_url(qr_url)
+                accounts._chmod_session_files(session_path)
+            except Exception as exc:
+                try:
+                    await self._disconnect(client)
+                finally:
+                    accounts._chmod_session_files(session_path)
+                safe_error = _safe_telegram_error(exc)
+                log.warning(
+                    "telegram_login.qr_start.failed profile=%s error=%s",
+                    profile_id,
+                    safe_error,
+                )
+                raise TelegramLoginAuthError(safe_error) from exc
+
+        login_id = self.token_factory()
+        expires_at = self._now() + timedelta(seconds=self.ttl_seconds)
+        flow = TelegramLoginFlow(
+            login_id=login_id,
+            profile_id=profile_id,
+            phone=getattr(profile, "phone", "") or "",
+            phone_masked=_mask_phone(getattr(profile, "phone", "") or ""),
+            session_path=str(session_path),
+            phone_code_hash="",
+            step="qr_pending",
+            expires_at=expires_at,
+            client=client,
+            qr=qr,
+            qr_url=qr_url,
+            qr_image=qr_image,
+        )
+        self._flows[login_id] = flow
+        self._profile_logins[profile_id] = login_id
+        flow.task = asyncio.create_task(self._run_qr_wait(flow))
+        log.info("telegram_login.qr_pending profile=%s", profile_id)
+        return self._qr_snapshot(flow)
+
+    async def _run_qr_wait(self, flow: TelegramLoginFlow) -> None:
+        """Background worker: wait for the QR scan, refreshing the token as it expires."""
+
+        session_path = Path(flow.session_path).expanduser()
+        try:
+            outcome = await self._qr_wait_loop(flow, session_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._fail_qr_flow(flow, exc)
+            return
+
+        if outcome == "password":
+            # Flow stays alive; submit_password reuses the existing 2FA path.
+            return
+        if outcome == "expired":
+            await self._expire_qr_flow(flow)
+            return
+
+        try:
+            async with telegram_client_factory.session_file_lock(session_path):
+                authorized = await self._is_user_authorized(flow.client)
+                accounts._chmod_session_files(session_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._fail_qr_flow(flow, exc)
+            return
+
+        if not authorized:
+            await self._fail_qr_flow(
+                flow,
+                TelegramLoginAuthError("Telegram QR login did not authorize the session"),
+            )
+            return
+        await self._finish_authorized_qr(flow)
+
+    async def _finish_authorized_qr(self, flow: TelegramLoginFlow) -> None:
+        """Finalize a scanned QR flow without discarding it.
+
+        QR success is delivered to the UI through status polling, so the flow
+        must stay findable as a terminal ``authorized`` snapshot — otherwise the
+        next poll races the discard and 404s even though login succeeded.
+        """
+        account = self._mark_authorized(flow.profile_id, authorized=True)
+        flow.account = account
+        flow.step = "authorized"
+        if self._profile_logins.get(flow.profile_id) == flow.login_id:
+            self._profile_logins.pop(flow.profile_id, None)
+        await self._disconnect(flow.client)
+        accounts._chmod_session_files(Path(flow.session_path).expanduser())
+        log.info("telegram_login.qr_authorized profile=%s", flow.profile_id)
+
+    async def _qr_wait_loop(self, flow: TelegramLoginFlow, session_path: Path) -> str:
+        deadline = self._now() + timedelta(seconds=self.ttl_seconds)
+        async with telegram_client_factory.session_file_lock(session_path):
+            while True:
+                remaining = (deadline - self._now()).total_seconds()
+                if remaining <= 0:
+                    return "expired"
+                timeout = self._qr_timeout(flow, remaining)
+                try:
+                    await _maybe_await(flow.qr.wait(timeout))
+                except asyncio.TimeoutError:
+                    await _maybe_await(flow.qr.recreate())
+                    self._refresh_qr(flow)
+                    accounts._chmod_session_files(session_path)
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if _is_password_required_error(exc):
+                        flow.step = "password_required"
+                        accounts._chmod_session_files(session_path)
+                        return "password"
+                    raise
+                accounts._chmod_session_files(session_path)
+                return "authorized"
+
+    def _qr_timeout(self, flow: TelegramLoginFlow, remaining: float) -> float:
+        candidates = [remaining]
+        expires = getattr(flow.qr, "expires", None)
+        if isinstance(expires, datetime):
+            exp = expires if expires.tzinfo else expires.replace(tzinfo=timezone.utc)
+            token_ttl = (exp - self._now()).total_seconds()
+            if token_ttl > 0:
+                candidates.append(token_ttl)
+        return max(1.0, min(candidates))
+
+    def _refresh_qr(self, flow: TelegramLoginFlow) -> None:
+        flow.qr_url = flow.qr.url
+        flow.qr_image = _qr_png_data_url(flow.qr.url)
+
+    async def _fail_qr_flow(self, flow: TelegramLoginFlow, exc: BaseException) -> None:
+        flow.error = _safe_telegram_error(exc)
+        flow.step = "error"
+        if self._profile_logins.get(flow.profile_id) == flow.login_id:
+            self._profile_logins.pop(flow.profile_id, None)
+        await self._disconnect(flow.client)
+        accounts._chmod_session_files(Path(flow.session_path).expanduser())
+        log.warning("telegram_login.qr_failed profile=%s error=%s", flow.profile_id, flow.error)
+
+    async def _expire_qr_flow(self, flow: TelegramLoginFlow) -> None:
+        flow.error = "Telegram QR login expired"
+        flow.step = "error"
+        if self._profile_logins.get(flow.profile_id) == flow.login_id:
+            self._profile_logins.pop(flow.profile_id, None)
+        await self._disconnect(flow.client)
+        accounts._chmod_session_files(Path(flow.session_path).expanduser())
+        log.info("telegram_login.qr_expired profile=%s", flow.profile_id)
+
+    async def _qr_login(self, client: Any) -> Any:
+        return await _maybe_await(_telegram_client(client).qr_login())
+
     async def submit_code(self, login_id: str, code: str) -> dict[str, Any]:
         """Submit the Telegram login code for an active flow."""
 
@@ -189,6 +411,12 @@ class TelegramLoginManager:
         if flow.step != "code_sent":
             raise LoginStepError("Login code cannot be submitted for this step")
 
+        # Диагностика: длина кода, не сам код (секрет наружу не пишем).
+        log.info(
+            "telegram_login.submit_code.start profile=%s code_len=%d",
+            flow.profile_id,
+            len(code or ""),
+        )
         async with telegram_client_factory.session_file_lock(Path(flow.session_path)):
             try:
                 await self._sign_in_code(flow, code)
@@ -196,17 +424,41 @@ class TelegramLoginManager:
                 accounts._chmod_session_files(Path(flow.session_path).expanduser())
                 if _is_password_required_error(exc):
                     flow.step = "password_required"
+                    log.info(
+                        "telegram_login.submit_code.password_required profile=%s",
+                        flow.profile_id,
+                    )
                     return self._flow_snapshot(flow, include_phone=False)
                 if _is_expired_code_error(exc):
+                    log.warning(
+                        "telegram_login.submit_code.expired profile=%s error=%s",
+                        flow.profile_id,
+                        _safe_telegram_error(exc),
+                    )
                     await self._discard_flow(flow)
                     raise InvalidTelegramCodeError(_expired_code_message(exc)) from exc
                 if _is_invalid_code_error(exc):
+                    log.warning(
+                        "telegram_login.submit_code.invalid profile=%s error=%s",
+                        flow.profile_id,
+                        _safe_telegram_error(exc),
+                    )
                     raise InvalidTelegramCodeError("Telegram rejected the login code") from exc
+                log.warning(
+                    "telegram_login.submit_code.failed profile=%s error=%s",
+                    flow.profile_id,
+                    _safe_telegram_error(exc),
+                )
                 raise TelegramLoginAuthError(_safe_telegram_error(exc)) from exc
             accounts._chmod_session_files(Path(flow.session_path).expanduser())
 
             if not await self._is_user_authorized(flow.client):
+                log.warning(
+                    "telegram_login.submit_code.not_authorized profile=%s",
+                    flow.profile_id,
+                )
                 raise TelegramLoginAuthError("Telegram login did not authorize the session")
+            log.info("telegram_login.submit_code.authorized profile=%s", flow.profile_id)
             return await self._finish_authorized(flow)
 
     async def submit_password(self, login_id: str, password: str) -> dict[str, Any]:
@@ -236,7 +488,7 @@ class TelegramLoginManager:
         """Return a public snapshot for an active login flow."""
 
         flow = await self._require_flow(login_id)
-        return self._flow_snapshot(flow)
+        return self._snapshot(flow)
 
     async def cancel(self, login_id: str) -> dict[str, bool]:
         """Cancel a login flow and disconnect its Telegram client."""
@@ -331,8 +583,46 @@ class TelegramLoginManager:
         self._flows.pop(flow.login_id, None)
         if self._profile_logins.get(flow.profile_id) == flow.login_id:
             self._profile_logins.pop(flow.profile_id, None)
+        await self._cancel_flow_task(flow)
         await self._disconnect(flow.client)
         accounts._chmod_session_files(Path(flow.session_path).expanduser())
+
+    async def _cancel_flow_task(self, flow: TelegramLoginFlow) -> None:
+        task = getattr(flow, "task", None)
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - worker already surfaced its own error
+            pass
+
+    def _snapshot(self, flow: TelegramLoginFlow) -> dict[str, Any]:
+        if flow.step == "qr_pending":
+            return self._qr_snapshot(flow)
+        if flow.step == "authorized":
+            return self._authorized_snapshot(flow.account)
+        if flow.step == "error":
+            return {
+                "login_id": flow.login_id,
+                "profile_id": flow.profile_id,
+                "step": "error",
+                "error": flow.error or "Telegram login failed",
+            }
+        return self._flow_snapshot(flow)
+
+    def _qr_snapshot(self, flow: TelegramLoginFlow) -> dict[str, Any]:
+        return {
+            "login_id": flow.login_id,
+            "profile_id": flow.profile_id,
+            "step": "qr_pending",
+            "qr_url": flow.qr_url,
+            "qr_image": flow.qr_image,
+            "expires_at": flow.expires_at.isoformat(),
+        }
 
     def _flow_snapshot(
         self,

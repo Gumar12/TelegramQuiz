@@ -678,6 +678,173 @@ def test_start_failure_chmods_sidecars_created_during_disconnect(tmp_path):
         assert _mode(session_path.with_name(f"{session_path.name}{suffix}")) == 0o600
 
 
+class QrPasswordError(Exception):
+    pass
+
+
+class FakeQRLogin:
+    def __init__(self, client: "FakeQrClient", script: list[str]):
+        self._client = client
+        self._script = list(script)
+        self.url = "tg://login?token=token-1"
+        self.expires = None
+        self.recreate_count = 0
+        self.wait_calls = 0
+        self.release = asyncio.Event()
+
+    async def recreate(self) -> None:
+        self.recreate_count += 1
+        self.url = f"tg://login?token=token-{self.recreate_count + 1}"
+
+    async def wait(self, timeout=None):
+        index = self.wait_calls
+        self.wait_calls += 1
+        action = self._script[index] if index < len(self._script) else self._script[-1]
+        if action == "timeout":
+            raise asyncio.TimeoutError()
+        if action == "password":
+            raise QrPasswordError("SESSION_PASSWORD_NEEDED")
+        if action == "hang":
+            await self.release.wait()
+            raise AssertionError("hang action was released unexpectedly")
+        if action == "user":
+            self._client.authorized = True
+            return SimpleNamespace(id=1)
+        raise AssertionError(f"unknown qr action {action!r}")
+
+
+class FakeQrClient(FakeTelegramClient):
+    def __init__(self, *, authorized: bool = False, script: list[str] | None = None):
+        super().__init__(authorized=authorized)
+        self._script = script or ["user"]
+        self.qr_login_calls = 0
+        self.qr: FakeQRLogin | None = None
+
+    async def qr_login(self, ignored_ids=None):
+        self.qr_login_calls += 1
+        self.qr = FakeQRLogin(self, self._script)
+        return self.qr
+
+
+async def _wait_until(predicate, *, attempts: int = 200, delay: float = 0.005):
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await asyncio.sleep(delay)
+    return False
+
+
+def test_qr_start_already_authorized_marks_account_without_building_qr():
+    accounts = FakeAccounts(is_authorized=True)
+    client = FakeQrClient(authorized=True)
+    manager = _manager(accounts, FakeClientFactory([client]))
+
+    result = asyncio.run(manager.start_qr("default"))
+
+    assert result == {
+        "step": "authorized",
+        "account": FakePublicAccount("default").to_dict(),
+    }
+    assert accounts.marked == [("default", True)]
+    assert client.qr_login_calls == 0
+    assert client.disconnected is True
+
+
+def test_qr_start_returns_pending_snapshot_and_authorizes_on_scan():
+    async def scenario():
+        accounts = FakeAccounts()
+        client = FakeQrClient(script=["user"])
+        manager = _manager(accounts, FakeClientFactory([client]))
+
+        started = await manager.start_qr("default")
+        task = manager._flows[started["login_id"]].task
+        await task
+        return started, accounts, client, manager
+
+    started, accounts, client, manager = asyncio.run(scenario())
+
+    assert started["step"] == "qr_pending"
+    assert started["login_id"] == "login-1"
+    assert started["qr_url"] == "tg://login?token=token-1"
+    assert started["qr_image"].startswith("data:image/png;base64,")
+    assert accounts.marked == [("default", True)]
+    assert client.disconnected is True
+    # The flow must survive as a terminal authorized snapshot so the next poll
+    # observes success instead of racing the discard and getting a 404.
+    status_after = asyncio.run(manager.status(started["login_id"]))
+    assert status_after["step"] == "authorized"
+    assert status_after["account"]["status"] == "enabled_authorized"
+
+
+def test_qr_recreates_token_on_timeout_and_refreshes_snapshot():
+    async def scenario():
+        accounts = FakeAccounts()
+        client = FakeQrClient(script=["timeout", "hang"])
+        manager = _manager(accounts, FakeClientFactory([client]))
+
+        started = await manager.start_qr("default")
+        login_id = started["login_id"]
+        await _wait_until(
+            lambda: client.qr is not None
+            and client.qr.recreate_count >= 1
+            and client.qr.wait_calls >= 2
+        )
+        status = await manager.status(login_id)
+        await manager.cancel(login_id)
+        return started, status, client
+
+    started, status, client = asyncio.run(scenario())
+
+    assert started["qr_url"] == "tg://login?token=token-1"
+    assert client.qr.recreate_count >= 1
+    assert status["step"] == "qr_pending"
+    assert status["qr_url"] == "tg://login?token=token-2"
+    assert status["qr_image"].startswith("data:image/png;base64,")
+
+
+def test_qr_password_required_then_password_success():
+    async def scenario():
+        accounts = FakeAccounts()
+        client = FakeQrClient(script=["password"])
+        manager = _manager(accounts, FakeClientFactory([client]))
+
+        started = await manager.start_qr("default")
+        login_id = started["login_id"]
+        await manager._flows[login_id].task
+        status = await manager.status(login_id)
+        result = await manager.submit_password(login_id, VALID_PASSWORD)
+        return status, result, accounts, client
+
+    status, result, accounts, client = asyncio.run(scenario())
+
+    assert status["step"] == "password_required"
+    assert result["step"] == "authorized"
+    assert accounts.marked == [("default", True)]
+    assert client.disconnected is True
+
+
+def test_qr_cancel_stops_background_task_and_disconnects():
+    async def scenario():
+        accounts = FakeAccounts()
+        client = FakeQrClient(script=["hang"])
+        manager = _manager(accounts, FakeClientFactory([client]))
+
+        started = await manager.start_qr("default")
+        login_id = started["login_id"]
+        task = manager._flows[login_id].task
+        await _wait_until(lambda: client.qr is not None and client.qr.wait_calls >= 1)
+        result = await manager.cancel(login_id)
+        await _wait_until(lambda: task.done())
+        return result, task, client, manager, login_id
+
+    result, task, client, manager, login_id = asyncio.run(scenario())
+
+    assert result == {"ok": True}
+    assert task.done()
+    assert client.disconnected is True
+    assert login_id not in manager._flows
+
+
 def test_public_snapshots_do_not_leak_raw_phone_api_hash_session_or_login_secrets():
     accounts = FakeAccounts()
     client = FakeTelegramClient(password_required=True)

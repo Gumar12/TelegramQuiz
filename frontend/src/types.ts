@@ -142,6 +142,22 @@ export interface TelegramLoginPasswordRequiredResponse {
   step: 'password_required';
 }
 
+export interface TelegramLoginQrPendingResponse {
+  login_id: string;
+  profile_id: string;
+  step: 'qr_pending';
+  qr_url: string;
+  qr_image: string;
+  expires_at: string;
+}
+
+export interface TelegramLoginErrorResponse {
+  login_id: string;
+  profile_id: string;
+  step: 'error';
+  error: string;
+}
+
 export interface TelegramLoginAuthorizedResponse {
   step: 'authorized';
   account: AccountProfilePublic;
@@ -151,9 +167,15 @@ export type TelegramLoginStartResponse =
   | TelegramLoginCodeSentResponse
   | TelegramLoginAuthorizedResponse;
 
+export type TelegramLoginQrStartResponse =
+  | TelegramLoginQrPendingResponse
+  | TelegramLoginAuthorizedResponse;
+
 export type TelegramLoginStatusResponse =
   | TelegramLoginCodeSentResponse
   | TelegramLoginPasswordRequiredResponse
+  | TelegramLoginQrPendingResponse
+  | TelegramLoginErrorResponse
   | TelegramLoginAuthorizedResponse;
 
 export type TelegramLoginCodeResponse =
@@ -245,4 +267,10 @@ export interface SettingsResponse {
     media: string;
     quizzes: string;
   };
+}
+
+export interface DeepSeekKeyStatus {
+  configured: boolean;
+  masked: string;
+  source: 'runtime' | 'env' | null;
 }

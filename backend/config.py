@@ -66,6 +66,7 @@ LOG_PATH = RUNTIME_DIR / "quizbot_uploader.log"
 PROBE_LOG_PATH = RUNTIME_DIR / "probe.log"
 
 # --- Optional AI markup for DOCX parsing ---
+DEEPSEEK_SETTINGS_FILENAME = "deepseek_settings.json"
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
 DEEPSEEK_BASE_URL = (os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip() or "https://api.deepseek.com").rstrip("/")
@@ -225,6 +226,72 @@ def estimate_timing_profile(mode: str, *, runtime_dir: str | Path | None = None)
 
 def _eta_settings_path(runtime_dir: str | Path | None = None) -> Path:
     return Path(runtime_dir) / ETA_SETTINGS_FILENAME if runtime_dir is not None else RUNTIME_DIR / ETA_SETTINGS_FILENAME
+
+
+def _deepseek_settings_path(runtime_dir: str | Path | None = None) -> Path:
+    base = Path(runtime_dir) if runtime_dir is not None else RUNTIME_DIR
+    return base / DEEPSEEK_SETTINGS_FILENAME
+
+
+def load_runtime_deepseek_api_key(runtime_dir: str | Path | None = None) -> str:
+    """Return the runtime-stored DeepSeek key, or '' if none is set."""
+    path = _deepseek_settings_path(runtime_dir)
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if isinstance(payload, dict):
+        return str(payload.get("api_key", "") or "").strip()
+    return ""
+
+
+def save_deepseek_api_key(api_key: str, runtime_dir: str | Path | None = None) -> str:
+    """Persist the DeepSeek key with private perms (0o600); return the stored value."""
+    key = (api_key or "").strip()
+    if not key:
+        raise ValueError("DeepSeek API key must not be empty")
+    path = _deepseek_settings_path(runtime_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    tmp.write_text(json.dumps({"api_key": key}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    return key
+
+
+def delete_deepseek_api_key(runtime_dir: str | Path | None = None) -> None:
+    """Remove the runtime-stored DeepSeek key (falls back to env afterwards)."""
+    try:
+        _deepseek_settings_path(runtime_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def resolve_deepseek_api_key(runtime_dir: str | Path | None = None) -> str:
+    """Runtime-stored key takes priority over the env-provided one."""
+    return load_runtime_deepseek_api_key(runtime_dir) or DEEPSEEK_API_KEY
+
+
+def mask_deepseek_api_key(api_key: str) -> str:
+    """Render a non-reversible mask for display (key itself never leaves backend)."""
+    key = (api_key or "").strip()
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "•" * len(key)
+    return f"{key[:3]}{'•' * 4}{key[-4:]}"
+
+
+def deepseek_key_status(runtime_dir: str | Path | None = None) -> dict[str, object]:
+    """Return a UI-safe status: configured flag, masked hint, source — never the key."""
+    runtime_key = load_runtime_deepseek_api_key(runtime_dir)
+    if runtime_key:
+        return {"configured": True, "masked": mask_deepseek_api_key(runtime_key), "source": "runtime"}
+    if DEEPSEEK_API_KEY:
+        return {"configured": True, "masked": mask_deepseek_api_key(DEEPSEEK_API_KEY), "source": "env"}
+    return {"configured": False, "masked": "", "source": None}
 
 
 def _avg_delay(value: object) -> float:
